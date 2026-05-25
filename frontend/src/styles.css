@@ -1,0 +1,430 @@
+:root {
+  color: #172033;
+  background: #f6f7fb;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  align-items: center;
+  background: #1457d9;
+  border: 0;
+  border-radius: 8px;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 8px;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 14px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+input,
+textarea,
+select {
+  background: #fff;
+  border: 1px solid #d7dce8;
+  border-radius: 8px;
+  color: #172033;
+  min-height: 40px;
+  padding: 9px 10px;
+  width: 100%;
+}
+
+textarea {
+  min-height: 78px;
+  resize: vertical;
+}
+
+label {
+  color: #5d6880;
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 340px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #101827;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 100vh;
+  padding: 20px;
+}
+
+.brand {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.brand strong {
+  display: block;
+  font-size: 18px;
+}
+
+.brand span,
+.episode-card span,
+.episode-card small {
+  color: #a7b1c4;
+  display: block;
+}
+
+.workspace {
+  min-width: 0;
+  padding: 22px;
+}
+
+.topbar {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.topbar h1 {
+  font-size: 24px;
+  line-height: 1.2;
+  margin: 0;
+}
+
+.topbar p {
+  color: #5d6880;
+  margin: 4px 0 0;
+}
+
+.topbar-actions,
+.actions,
+.filters,
+.upload-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.panel {
+  background: #fff;
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(18, 31, 55, 0.06);
+  padding: 16px;
+}
+
+.sidebar .panel {
+  background: #172033;
+  border-color: #2b374d;
+  box-shadow: none;
+}
+
+.panel-title {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.panel-title h2 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.compact,
+.stack {
+  display: grid;
+  gap: 10px;
+}
+
+.two-col {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.episode-list {
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+}
+
+.episode-card {
+  background: #172033;
+  border: 1px solid #2b374d;
+  border-radius: 8px;
+  color: #fff;
+  display: grid;
+  gap: 4px;
+  justify-content: stretch;
+  padding: 12px;
+  text-align: left;
+}
+
+.episode-card.active {
+  border-color: #6ee7b7;
+}
+
+.grid-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(320px, 1.1fr);
+}
+
+.intake,
+.controls,
+.board,
+.detail {
+  min-width: 0;
+}
+
+.controls {
+  align-self: start;
+}
+
+.board,
+.detail {
+  min-height: 420px;
+}
+
+.board-head,
+.detail-head {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.toggle-grid,
+.platforms {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.toggle-grid label,
+.platforms label {
+  align-items: center;
+  background: #f6f7fb;
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  color: #172033;
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+}
+
+.toggle-grid input,
+.platforms input {
+  min-height: auto;
+  width: auto;
+}
+
+.transcript-box {
+  min-height: 140px;
+}
+
+.clip-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.clip-row {
+  background: #f8fafc;
+  border: 1px solid #e3e7ef;
+  color: #172033;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 54px;
+  justify-content: stretch;
+  min-height: 58px;
+  text-align: left;
+}
+
+.clip-row.active {
+  border-color: #1457d9;
+}
+
+.clip-row small {
+  color: #5d6880;
+  display: block;
+}
+
+.rank,
+.score,
+.score-large {
+  align-items: center;
+  background: #e9f8f2;
+  border-radius: 8px;
+  color: #0f8f68;
+  display: inline-flex;
+  font-weight: 800;
+  justify-content: center;
+}
+
+.score-large {
+  font-size: 24px;
+  height: 58px;
+  width: 64px;
+}
+
+.detail h2,
+.detail p {
+  margin-top: 0;
+}
+
+.excerpt {
+  background: #f6f7fb;
+  border-left: 4px solid #6ee7b7;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.reasoning {
+  color: #4b5568;
+}
+
+.score-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 14px 0;
+}
+
+.score-grid span {
+  background: #f8fafc;
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  color: #5d6880;
+  display: grid;
+  font-size: 12px;
+  gap: 4px;
+  padding: 10px;
+}
+
+.score-grid strong {
+  color: #172033;
+  font-size: 18px;
+}
+
+.metadata-tabs {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.metadata-card {
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.metadata-card h3 {
+  font-size: 15px;
+  margin: 6px 0;
+}
+
+.metadata-card p,
+.metadata-card small {
+  color: #5d6880;
+}
+
+.render-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.render-list a {
+  background: #eef4ff;
+  border-radius: 8px;
+  color: #1457d9;
+  padding: 8px 10px;
+  text-decoration: none;
+}
+
+.ghost {
+  background: #eef2f7;
+  color: #172033;
+  min-width: 42px;
+  padding: 0;
+}
+
+.secondary {
+  background: #0f8f68;
+}
+
+.danger {
+  background: #d93f4c;
+}
+
+.status-line,
+.empty {
+  background: #fff7e6;
+  border: 1px solid #ffd28c;
+  border-radius: 8px;
+  color: #7a4a00;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 1120px) {
+  .app-shell,
+  .grid-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    min-height: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .workspace {
+    padding: 14px;
+  }
+
+  .topbar,
+  .board-head,
+  .detail-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .two-col,
+  .toggle-grid,
+  .platforms,
+  .metadata-tabs,
+  .score-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+dist/
+build/
+storage/uploads/
+storage/exports/
+*.pyc
+*.log
+Podcast Automation Assets/
+Podcast Automation Assets/
