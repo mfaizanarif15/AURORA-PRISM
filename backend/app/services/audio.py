@@ -5,9 +5,17 @@ import math
 import wave
 from pathlib import Path
 
+from loguru import logger
+
 
 def audio_confidence_for_range(path: Path | None, start_seconds: float, end_seconds: float) -> int:
     if path is None or not path.exists() or path.suffix.lower() != ".wav":
+        logger.debug(
+            "Audio confidence using default score path={} start={} end={} reason=missing_or_not_wav",
+            path,
+            start_seconds,
+            end_seconds,
+        )
         return 64
     try:
         with contextlib.closing(wave.open(str(path), "rb")) as wav:
@@ -23,8 +31,23 @@ def audio_confidence_for_range(path: Path | None, start_seconds: float, end_seco
             rms = _rms(raw, sample_width, channels)
             normalized = min(1.0, rms / 12000)
             confidence = 52 + int(normalized * 38)
-            return max(45, min(92, confidence))
-    except Exception:
+            bounded = max(45, min(92, confidence))
+            logger.debug(
+                "Audio confidence calculated path={} start={} end={} confidence={}",
+                path,
+                start_seconds,
+                end_seconds,
+                bounded,
+            )
+            return bounded
+    except Exception as exc:
+        logger.warning(
+            "Audio confidence failed path={} start={} end={} error={}",
+            path,
+            start_seconds,
+            end_seconds,
+            exc,
+        )
         return 64
 
 

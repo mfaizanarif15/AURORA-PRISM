@@ -24,7 +24,17 @@ services:
       STORAGE_ROOT: /app/storage
       ANALYSIS_MODE: ${ANALYSIS_MODE:-true}
       AI_PROVIDER: ${AI_PROVIDER:-azure_openai}
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-true}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-aurora-prism-local}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-aurora-prism-local}
+      LANGFUSE_BASE_URL: ${LANGFUSE_DOCKER_BASE_URL:-http://host.docker.internal:3005}
+      LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-local}
+      LANGFUSE_RELEASE: ${LANGFUSE_RELEASE:-aurora-prism-mvp}
+      LANGFUSE_CAPTURE_LLM_IO: ${LANGFUSE_CAPTURE_LLM_IO:-true}
+      LANGFUSE_MAX_LLM_IO_CHARS: ${LANGFUSE_MAX_LLM_IO_CHARS:-250000}
       DEMO_ASSETS_DIR: /app/demo-assets
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8100:8000"
     volumes:
@@ -60,7 +70,7 @@ services:
       langfuse-redis:
         condition: service_healthy
     environment: &langfuse-env
-      NEXTAUTH_URL: http://localhost:3200
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_HOST_PORT:-3005}
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
       SALT: aurora-prism-local-salt
       ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
@@ -96,19 +106,19 @@ services:
     profiles: ["langfuse"]
     depends_on: *langfuse-depends-on
     ports:
-      - "3200:3000"
+      - "${LANGFUSE_HOST_PORT:-3005}:3000"
     environment:
       <<: *langfuse-env
       NEXTAUTH_SECRET: aurora-prism-local-nextauth-secret
-      LANGFUSE_INIT_ORG_ID: aurora-prism-local-org
-      LANGFUSE_INIT_ORG_NAME: AURORA PRISM Local
-      LANGFUSE_INIT_PROJECT_ID: aurora-prism-local-project
-      LANGFUSE_INIT_PROJECT_NAME: AURORA PRISM
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-aurora-prism-local
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-aurora-prism-local
-      LANGFUSE_INIT_USER_EMAIL: admin@aurora.local
-      LANGFUSE_INIT_USER_NAME: AURORA Admin
-      LANGFUSE_INIT_USER_PASSWORD: aurora-langfuse-local
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-aurora-prism-local-org}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-AURORA PRISM Local}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-aurora-prism-local-project}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-AURORA PRISM Local}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-aurora-prism-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-aurora-prism-local}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@aurora.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-AURORA Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-aurora-langfuse-local}
 
   langfuse-clickhouse:
     image: docker.io/clickhouse/clickhouse-server:latest

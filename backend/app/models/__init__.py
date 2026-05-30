@@ -10,6 +10,7 @@ from app.models.entities import (
     ExportPack,
     RenderedClip,
     TranscriptSegment,
+    User,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "ExportPack",
     "RenderedClip",
     "TranscriptSegment",
+    "User",
 ]

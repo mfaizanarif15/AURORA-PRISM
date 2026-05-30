@@ -4,6 +4,7 @@ AURORA PRISM is a FastAPI + React + PostgreSQL MVP for podcast clip discovery. I
 
 For complete setup and startup instructions, see [SETUP.md](SETUP.md).
 For backend endpoint contracts, see [API_REFERENCE.md](API_REFERENCE.md).
+For PostgreSQL table details, see [DATABASE_TABLES.md](DATABASE_TABLES.md).
 
 ## Run With Docker
 
@@ -15,7 +16,13 @@ Frontend: `http://localhost:6173`
 Backend health: `http://localhost:8100/api/health`  
 Backend API docs: `http://localhost:8100/docs`  
 Langfuse status: `http://localhost:8100/api/observability/langfuse`  
-Local Langfuse dashboard: `http://localhost:3200`
+Local Langfuse dashboard: `http://localhost:3005`
+
+Backend logs are written to Docker output and to `storage/logs/backend.log` by default:
+
+```bash
+docker compose logs -f backend
+```
 
 To start local Langfuse too:
 
@@ -34,21 +41,37 @@ docker compose exec backend python scripts/seed_demo.py
 - FastAPI API under `/api`
 - SQLAlchemy 2.0 async ORM
 - Alembic migrations
-- PostgreSQL storage
+- PostgreSQL storage with 12 application tables documented in [DATABASE_TABLES.md](DATABASE_TABLES.md)
 - FFmpeg rendering inside the backend container
-- `uv` is used inside Docker for Python dependency installation; no local virtualenv is required
-- Mock/hybrid analysis mode for reliable demos
+- `uv` is used for Python dependency management from `backend/pyproject.toml`
+- Mock, hybrid, and LLM-only analysis modes for clip selection and platform metadata
 - Azure OpenAI is the default AI provider, with standard OpenAI available as the second option
 - Optional Langfuse observability for analysis, render, and export traces
 
-Useful commands:
+Local backend with `uv`:
 
 ```bash
+docker compose up -d postgres
 cd backend
+uv sync
+source .venv/bin/activate
 alembic upgrade head
-uvicorn app.main:app --reload
-pytest
+uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload
 ```
+
+Or without activating:
+
+```bash
+docker compose up -d postgres
+cd backend
+uv run alembic upgrade head
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload
+uv run pytest
+```
+
+The backend loads the project `.env` from either the repo root or `backend/`. For local runs, use `DATABASE_URL=postgresql+asyncpg://aurora:aurora@localhost:55433/aurora_prism`. If the Docker backend is already running, port `8100` is busy; stop that service with `docker compose stop backend` or run local Uvicorn on another port, such as `8101`.
+
+The app supports database-backed sign up and login. If the `users` table is empty, the configured local admin credentials can bootstrap the first user; change `AUTH_PASSWORD` and `AUTH_SESSION_SECRET` in `.env` for any shared environment. Episode history is scoped per user, so each signed-in user only sees and operates on episodes they created. The account settings dialog lets users update display name, username, and password. The workspace sidebar can be collapsed to a compact new-episode rail, and episode titles can be edited manually or generated from episode context; untitled episodes are also auto-titled after analysis.
 
 ## AI Provider Settings
 
@@ -72,15 +95,24 @@ OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
+Analysis modes:
+
+- `mock`: local heuristic clip selection, no LLM call
+- `hybrid`: LLM ranks/refines shortlisted candidates, then falls back to heuristics if the provider is unavailable
+- `openai`: provider-backed LLM analysis is required
+
+Langfuse traces for `hybrid` and `openai` analysis include an enterprise generation record named `llm_clip_analysis`. When `LANGFUSE_CAPTURE_LLM_IO=true`, the trace input contains the exact system/user chat messages and prompt payload, and the output contains the raw assistant JSON, parsed JSON, normalized clips, token usage, retry metadata, model, provider, and prompt version. Set `LANGFUSE_CAPTURE_LLM_IO=false` in sensitive environments to store hashes, lengths, and summaries instead of raw transcript/prompt text.
+
 ## Frontend
 
 ```bash
 cd frontend
 npm install
 npm run dev
+VITE_PROXY_TARGET=http://localhost:8101 npm run dev
 ```
 
-The UI includes episode intake, context setup, media/transcript uploads, clip instructions, PRISM Board filters, clip detail, approval actions, render controls, and export generation.
+The UI includes login/logout, episode intake, context setup, media/transcript uploads, clip instructions, PRISM Board filters, clip detail, approval actions, render controls, and export generation.
 
 ## Clip Modes
 

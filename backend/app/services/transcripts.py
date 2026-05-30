@@ -5,6 +5,8 @@ import io
 import re
 from dataclasses import dataclass
 
+from loguru import logger
+
 
 SPEAKER_TS_RE = re.compile(
     r"^(?P<speaker>.*?)\s*\((?P<ts>\d{1,2}:\d{2}(?::\d{2})?(?:[\.,]\d{1,3})?)\)\s*$"
@@ -51,6 +53,7 @@ def seconds_to_timestamp(seconds: float) -> str:
 
 def parse_transcript(content: str, source_format: str = "txt") -> list[ParsedSegment]:
     source_format = source_format.lower().strip(".")
+    logger.info("Parsing transcript source_format={} content_length={}", source_format, len(content))
     if source_format == "csv":
         segments = _parse_csv(content)
     elif "-->" in content or source_format in {"vtt", "srt"}:
@@ -59,8 +62,11 @@ def parse_transcript(content: str, source_format: str = "txt") -> list[ParsedSeg
         segments = _parse_riverside_txt(content)
 
     if not segments:
+        logger.info("Transcript parser found no timed segments, falling back to untimed text")
         segments = _parse_untimed_text(content)
-    return _finalize_end_times(segments)
+    finalized = _finalize_end_times(segments)
+    logger.info("Transcript parsed source_format={} segment_count={}", source_format, len(finalized))
+    return finalized
 
 
 def _parse_csv(content: str) -> list[ParsedSegment]:
@@ -82,6 +88,7 @@ def _parse_csv(content: str) -> list[ParsedSegment]:
                 text=_clean_text(text),
             )
         )
+    logger.debug("CSV transcript parser produced segments={}", len(segments))
     return segments
 
 
@@ -109,7 +116,9 @@ def _parse_timed_cues(content: str) -> list[ParsedSegment]:
                 text=_clean_text(text),
             )
         )
-    return [segment for segment in segments if segment.text]
+    parsed = [segment for segment in segments if segment.text]
+    logger.debug("Timed cue transcript parser produced segments={}", len(parsed))
+    return parsed
 
 
 def _parse_riverside_txt(content: str) -> list[ParsedSegment]:
@@ -154,6 +163,7 @@ def _parse_riverside_txt(content: str) -> list[ParsedSegment]:
         else:
             buffer.append(stripped)
     flush()
+    logger.debug("Riverside transcript parser produced segments={}", len(segments))
     return segments
 
 
@@ -174,6 +184,7 @@ def _parse_untimed_text(content: str) -> list[ParsedSegment]:
             )
         )
         cursor += duration
+    logger.debug("Untimed transcript parser produced segments={}", len(segments))
     return segments
 
 

@@ -21,10 +21,27 @@ class TimestampMixin:
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class User(Base, TimestampMixin):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    username: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(64), default="Content Operations")
+    password_hash: Mapped[str] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    episodes: Mapped[list["Episode"]] = relationship(back_populates="owner")
+
+
 class Episode(Base, TimestampMixin):
     __tablename__ = "episodes"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(255))
     guest_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     guest_role: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -33,6 +50,7 @@ class Episode(Base, TimestampMixin):
     theme: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(64), default="draft")
 
+    owner: Mapped[User | None] = relationship(back_populates="episodes")
     context: Mapped["EpisodeContext | None"] = relationship(
         back_populates="episode", cascade="all, delete-orphan", uselist=False
     )

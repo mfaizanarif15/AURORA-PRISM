@@ -9,6 +9,7 @@ export type Episode = {
   status: string;
   clip_count: number;
   asset_count: number;
+  media_asset_count: number;
   transcript_segment_count: number;
 };
 
@@ -44,6 +45,47 @@ export type RenderedClip = {
   status: string;
   filename?: string | null;
   error?: string | null;
+};
+
+export type EpisodeEvent = {
+  id: number;
+  episode_id: string;
+  event_type: string;
+  message: string;
+  level: "info" | "success" | "warning" | "error" | string;
+  progress?: number | null;
+  data: Record<string, unknown>;
+  created_at: string;
+};
+
+export type AnalysisRun = {
+  id: string;
+  episode_id: string;
+  status: string;
+  mode: string;
+  summary?: string | null;
+  generated_clip_count: number;
+};
+
+export type AuthUser = {
+  id: string;
+  username: string;
+  display_name: string;
+  role: string;
+};
+
+export type AuthSession = {
+  access_token: string;
+  token_type: "bearer" | string;
+  expires_at: number;
+  user: AuthUser;
+};
+
+export type AuthProfilePayload = {
+  username?: string;
+  display_name?: string;
+  current_password?: string;
+  new_password?: string;
 };
 
 export type Clip = {

@@ -12,7 +12,124 @@ Interactive OpenAPI docs:
 http://localhost:8100/docs
 ```
 
-The MVP currently has no authentication layer. All endpoints return JSON unless the endpoint name says `download`.
+Database schema and table details are documented in [DATABASE_TABLES.md](DATABASE_TABLES.md).
+
+Authentication is enabled by default. Call `POST /auth/login` and send the returned bearer token as:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+For browser APIs that cannot attach custom headers, such as EventSource and direct downloads, the frontend appends `?token=<access_token>`.
+
+The app supports database-backed sign up and login. If the `users` table is empty, these configured local credentials can bootstrap the first user:
+
+```text
+Username: admin
+Password: aurora-admin
+```
+
+All endpoints return JSON unless the endpoint name says `download`.
+
+## Authentication
+
+### POST `/auth/signup`
+
+Creates a database-backed user and returns a bearer session.
+
+Input JSON:
+
+```json
+{
+  "username": "operator",
+  "display_name": "AURORA Operator",
+  "password": "strong-password"
+}
+```
+
+Output:
+
+```json
+{
+  "access_token": "signed-session-token",
+  "token_type": "bearer",
+  "expires_at": 1790000000,
+  "user": {
+    "id": "user-uuid",
+    "username": "operator",
+    "display_name": "AURORA Operator",
+    "role": "Content Operations"
+  }
+}
+```
+
+### POST `/auth/login`
+
+Input JSON:
+
+```json
+{
+  "username": "admin",
+  "password": "aurora-admin"
+}
+```
+
+Output:
+
+```json
+{
+  "access_token": "signed-session-token",
+  "token_type": "bearer",
+  "expires_at": 1790000000,
+  "user": {
+    "id": "user-uuid",
+    "username": "admin",
+    "display_name": "AURORA Operator",
+    "role": "Content Operations"
+  }
+}
+```
+
+### GET `/auth/me`
+
+Returns the current authenticated user.
+
+### PATCH `/auth/me`
+
+Updates the current user's profile and optionally changes password. Returns a fresh bearer session.
+
+Input JSON:
+
+```json
+{
+  "username": "operator",
+  "display_name": "AURORA Operator",
+  "current_password": "old-password",
+  "new_password": "new-password"
+}
+```
+
+For profile-only changes, omit `current_password` and `new_password`. Password changes require the current password.
+
+Output:
+
+```json
+{
+  "access_token": "new-signed-session-token",
+  "token_type": "bearer",
+  "expires_at": 1790000000,
+  "user": {
+    "id": "user-uuid",
+    "username": "operator",
+    "display_name": "AURORA Operator",
+    "role": "Content Operations"
+  }
+}
+```
+
+### POST `/auth/logout`
+
+Returns `{ "status": "ok" }`. The backend revokes the current token for the running process and the browser clears its stored session token.
 
 ## Common Values
 
@@ -198,15 +315,19 @@ Output:
   "sdk_available": true,
   "base_url": "http://langfuse-web:3000",
   "environment": "local",
-  "release": "aurora-prism-mvp"
+  "release": "aurora-prism-mvp",
+  "capture_llm_io": true,
+  "max_llm_io_chars": 250000
 }
 ```
+
+LLM-backed analysis creates a Langfuse generation named `llm_clip_analysis`. When `capture_llm_io` is true, the generation input includes the exact system/user messages and prompt payload, and the output includes the raw assistant JSON, parsed JSON, normalized clips, token usage, retry metadata, provider, model, and prompt version.
 
 ## Episodes
 
 ### GET `/episodes`
 
-Lists all episodes, newest first.
+Lists the authenticated user's episodes, newest first. Other users' episode history is hidden.
 
 Input: none
 
@@ -232,7 +353,7 @@ Output:
 
 ### POST `/episodes`
 
-Creates a new episode. Status defaults to `draft`.
+Creates a new episode owned by the authenticated user. Status defaults to `draft`. If no title is supplied, the API uses `Untitled episode` so the UI can create a workspace first and name it later.
 
 Input JSON:
 
@@ -247,9 +368,7 @@ Input JSON:
 }
 ```
 
-Required fields:
-
-- `title`
+Required fields: none
 
 Output: `EpisodeRead`
 
@@ -274,6 +393,78 @@ Output: `EpisodeRead`
 Errors:
 
 - `404` if the episode does not exist
+
+### PATCH `/episodes/{episode_id}`
+
+Updates editable episode details. This is used by the episode details dialog for renaming and profile context changes.
+
+Path params:
+
+- `episode_id`: episode UUID
+
+Input JSON:
+
+```json
+{
+  "title": "Enterprise AI Governance with Dr. Seth Dobrin",
+  "guest_name": "Dr. Seth Dobrin",
+  "guest_role": "Founder and CEO",
+  "guest_company": "Qantm AI",
+  "recording_date": "2024-11-25",
+  "theme": "AI governance"
+}
+```
+
+All fields are optional. Blank optional fields are stored as `null`; a blank title becomes `Untitled episode`.
+
+Output: `EpisodeRead`
+
+Errors:
+
+- `404` if the episode does not exist or does not belong to the authenticated user
+
+### POST `/episodes/{episode_id}/auto-title`
+
+Generates and saves a concise episode title from the episode metadata, context, and transcript excerpt. The frontend uses this endpoint from Episode details and automatically after analysis when the episode is still named `Untitled episode`. If the configured LLM provider is unavailable, the API falls back to a local title heuristic.
+
+Path params:
+
+- `episode_id`: episode UUID
+
+Input JSON:
+
+```json
+{
+  "ai_provider": "azure_openai"
+}
+```
+
+Output: `EpisodeRead`
+
+Errors:
+
+- `404` if the episode does not exist or does not belong to the authenticated user
+
+### DELETE `/episodes/{episode_id}`
+
+Deletes one owned episode from history. Child records such as context, assets, transcript segments, analysis runs, clips, rendered clips, approval events, and export packs are removed through episode cascades.
+
+Path params:
+
+- `episode_id`: episode UUID
+
+Output:
+
+```json
+{
+  "status": "deleted",
+  "episode_id": "uuid"
+}
+```
+
+Errors:
+
+- `404` if the episode does not exist or does not belong to the authenticated user
 
 ### PATCH `/episodes/{episode_id}/context`
 
@@ -434,7 +625,7 @@ Input JSON:
   "target_clip_count": 10,
   "platforms": ["youtube_shorts", "tiktok", "instagram_reels", "linkedin"],
   "custom_instructions": "Focus on AI governance and avoid salesy clips.",
-  "mode": "mock"
+  "mode": "hybrid"
 }
 ```
 
@@ -444,7 +635,7 @@ Field notes:
 - `clip_types`: use `short`, `highlight`, or both
 - `duration_min_seconds` and `duration_max_seconds`: optional custom override
 - `target_clip_count`: 1 to 30
-- `mode`: currently stored on the analysis run; default is `mock`
+- `mode`: `mock` uses local heuristics only, `hybrid` uses the LLM with heuristic fallback, and `openai` requires a provider-backed LLM call
 
 Default durations:
 
@@ -458,8 +649,8 @@ Output:
   "id": "analysis-run-uuid",
   "episode_id": "episode-uuid",
   "status": "completed",
-  "mode": "mock",
-  "summary": "Generated 10 recommended clips across short, highlight using azure_openai provider settings.",
+  "mode": "hybrid",
+  "summary": "Generated 10 recommended clips across short, highlight using llm:azure_openai.",
   "generated_clip_count": 10
 }
 ```
@@ -714,7 +905,7 @@ curl -X POST http://localhost:8100/api/episodes/{episode_id}/transcript \
 ```bash
 curl -X POST http://localhost:8100/api/episodes/{episode_id}/analyze \
   -H "Content-Type: application/json" \
-  -d '{"ai_provider":"azure_openai","clip_types":["short","highlight"],"target_clip_count":10,"platforms":["youtube_shorts","tiktok","instagram_reels","linkedin"],"mode":"mock"}'
+  -d '{"ai_provider":"azure_openai","clip_types":["short","highlight"],"target_clip_count":10,"platforms":["youtube_shorts","tiktok","instagram_reels","linkedin"],"mode":"hybrid"}'
 ```
 
 6. Approve a clip:

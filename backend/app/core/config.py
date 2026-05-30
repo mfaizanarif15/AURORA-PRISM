@@ -5,6 +5,10 @@ from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = BACKEND_ROOT.parent
+
+
 class Settings(BaseSettings):
     app_name: str = "AURORA PRISM"
     environment: str = "local"
@@ -33,10 +37,25 @@ class Settings(BaseSettings):
     langfuse_base_url: str = "https://cloud.langfuse.com"
     langfuse_environment: str | None = None
     langfuse_release: str | None = "aurora-prism-mvp"
+    langfuse_capture_llm_io: bool = True
+    langfuse_max_llm_io_chars: int = 250000
+    log_level: str = "INFO"
+    log_to_file: bool = True
+    log_file: Path | None = None
     max_upload_mb: int = 2048
+    auth_enabled: bool = True
+    auth_username: str = "admin"
+    auth_password: str = "aurora-admin"
+    auth_display_name: str = "AURORA Operator"
+    auth_role: str = "Content Operations"
+    auth_session_secret: str = "aurora-prism-local-session-secret"
+    auth_token_ttl_minutes: int = 480
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True
+        env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator("ai_provider")
@@ -62,6 +81,44 @@ class Settings(BaseSettings):
         if normalized in {"false", "0", "no", "n", "off", "live", "openai", "azure_openai"}:
             return False
         return True
+
+    @field_validator("storage_root")
+    @classmethod
+    def resolve_storage_root(cls, value: Path) -> Path:
+        if value.is_absolute():
+            return value
+        return PROJECT_ROOT / value
+
+    @field_validator("log_level")
+    @classmethod
+    def normalize_log_level(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized in {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}:
+            return normalized
+        return "INFO"
+
+    @field_validator("log_file", mode="before")
+    @classmethod
+    def normalize_log_file(cls, value: object) -> object:
+        if value is None or str(value).strip() == "":
+            return None
+        return value
+
+    @field_validator("auth_session_secret")
+    @classmethod
+    def normalize_auth_session_secret(cls, value: str) -> str:
+        normalized = value.strip()
+        return normalized or "aurora-prism-local-session-secret"
+
+    @field_validator("auth_token_ttl_minutes")
+    @classmethod
+    def normalize_auth_token_ttl_minutes(cls, value: int) -> int:
+        return max(5, value)
+
+    @field_validator("langfuse_max_llm_io_chars")
+    @classmethod
+    def normalize_langfuse_max_llm_io_chars(cls, value: int) -> int:
+        return max(1000, value)
 
     @property
     def uploads_dir(self) -> Path:

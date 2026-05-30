@@ -7,6 +7,7 @@ Create Date: 2026-05-22
 
 from collections.abc import Sequence
 
+from loguru import logger
 import sqlalchemy as sa
 from alembic import op
 
@@ -24,6 +25,7 @@ def timestamps() -> list[sa.Column]:
 
 
 def upgrade() -> None:
+    logger.info("Applying initial schema migration revision={}", revision)
     op.create_table(
         "episodes",
         sa.Column("id", sa.String(length=36), nullable=False),
@@ -192,9 +194,11 @@ def upgrade() -> None:
     op.create_index("ix_assets_episode_type", "assets", ["episode_id", "asset_type"])
     op.create_index("ix_clips_episode_status", "clip_candidates", ["episode_id", "status"])
     op.create_index("ix_transcript_episode_start", "transcript_segments", ["episode_id", "start_seconds"])
+    logger.info("Initial schema migration applied revision={}", revision)
 
 
 def downgrade() -> None:
+    logger.info("Reverting initial schema migration revision={}", revision)
     op.drop_index("ix_transcript_episode_start", table_name="transcript_segments")
     op.drop_index("ix_clips_episode_status", table_name="clip_candidates")
     op.drop_index("ix_assets_episode_type", table_name="assets")
@@ -209,3 +213,4 @@ def downgrade() -> None:
     op.drop_table("assets")
     op.drop_table("episode_contexts")
     op.drop_table("episodes")
+    logger.info("Initial schema migration reverted revision={}", revision)

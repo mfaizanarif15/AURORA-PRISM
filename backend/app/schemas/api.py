@@ -4,12 +4,25 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class EpisodeCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=255)
+    title: str = Field(default="Untitled episode", min_length=1, max_length=255)
     guest_name: str | None = None
     guest_role: str | None = None
     guest_company: str | None = None
     recording_date: str | None = None
     theme: str | None = None
+
+
+class EpisodeUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    guest_name: str | None = None
+    guest_role: str | None = None
+    guest_company: str | None = None
+    recording_date: str | None = None
+    theme: str | None = None
+
+
+class EpisodeAutoTitleRequest(BaseModel):
+    ai_provider: Literal["azure_openai", "openai"] = "azure_openai"
 
 
 class EpisodeContextUpdate(BaseModel):
@@ -29,6 +42,38 @@ class TranscriptIn(BaseModel):
     source_format: str = "txt"
 
 
+class AuthLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=255)
+
+
+class AuthSignupRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=255)
+    display_name: str | None = Field(default=None, max_length=255)
+    password: str = Field(min_length=8, max_length=255)
+
+
+class AuthProfileUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=255)
+    display_name: str | None = Field(default=None, max_length=255)
+    current_password: str | None = Field(default=None, min_length=1, max_length=255)
+    new_password: str | None = Field(default=None, min_length=8, max_length=255)
+
+
+class AuthUserRead(BaseModel):
+    id: str
+    username: str
+    display_name: str
+    role: str
+
+
+class AuthSessionRead(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: int
+    user: AuthUserRead
+
+
 class AnalysisRequest(BaseModel):
     ai_provider: Literal["azure_openai", "openai"] = "azure_openai"
     clip_types: list[Literal["short", "highlight"]] = Field(default_factory=lambda: ["short", "highlight"])
@@ -37,7 +82,7 @@ class AnalysisRequest(BaseModel):
     target_clip_count: int = Field(default=10, ge=1, le=30)
     platforms: list[str] = Field(default_factory=lambda: ["youtube_shorts", "linkedin", "instagram_reels", "tiktok"])
     custom_instructions: str | None = None
-    mode: Literal["mock", "hybrid", "openai"] = "mock"
+    mode: Literal["mock", "hybrid", "openai"] = "hybrid"
 
 
 class ClipStatusUpdate(BaseModel):
@@ -124,6 +169,7 @@ class EpisodeRead(BaseModel):
     status: str
     clip_count: int = 0
     asset_count: int = 0
+    media_asset_count: int = 0
     transcript_segment_count: int = 0
 
 
