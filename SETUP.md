@@ -7,6 +7,7 @@ This guide explains how to configure, start, seed, and validate the AURORA PRISM
 - Docker and Docker Compose
 - Node.js 24+ only if running the frontend outside Docker
 - Python 3.12 only if running the backend outside Docker
+- FFmpeg only if rendering media while running the backend outside Docker
 - The provided `Podcast Automation Assets/` folder in the project root
 
 The recommended setup is Docker. The backend Docker image installs Python dependencies from `backend/pyproject.toml` with `uv`. You can also run the backend locally with `uv` and `backend/.venv`.
@@ -41,6 +42,7 @@ AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_KEY=your-azure-key
 AZURE_OPENAI_API_VERSION=2025-03-01-preview
 AZURE_OPENAI_CHAT_DEPLOYMENT=your-chat-deployment-name
+AZURE_OPENAI_TRANSCRIPTION_DEPLOYMENT=your-whisper-or-transcription-deployment-name
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
 ```
 
@@ -59,7 +61,10 @@ To use standard OpenAI instead:
 AI_PROVIDER=openai
 OPENAI_API_KEY=your-openai-key
 OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TRANSCRIPTION_MODEL=whisper-1
 ```
+
+Audio uploads use standard OpenAI Whisper transcription when `OPENAI_API_KEY` is set. If no OpenAI key or Azure transcription deployment is configured, the audio asset is saved and transcription is skipped without replacing any existing transcript.
 
 Analysis runs can use three modes from the UI/API:
 
@@ -161,24 +166,24 @@ This loads the Dr. Seth demo episode from:
 Podcast Automation Assets/
 ```
 
-The seed script uses the transcript, video, audio, content PDF, and questionnaire PDF, then creates mock clip recommendations.
+The seed script uses the transcript, video, audio, content PDF, and questionnaire PDF, then creates mock output recommendations.
 
 ## 4. Use The App
 
 1. Open `http://localhost:6173`.
 2. Sign in with the configured bootstrap credentials or create a user with the sign-up option.
 3. Select or create an episode.
-4. Upload video, audio, transcript, guest documents, guest images, or brand references.
-5. Add context: ICP, hot topic, TKXEL services, business goals, and editor notes.
-6. Choose clip settings:
+4. Upload video, audio, transcript, or guest documents.
+5. Add context: Ideal Customer Profile, hot topic, business goals, and editor notes.
+6. Choose output settings:
    - Shorts: 30-90 seconds
    - Highlights: 3-6 minutes
    - Optional custom duration, clip count, platforms, and instructions
 7. Select AI provider: Azure OpenAI or OpenAI.
 8. Click Analyze.
-9. Review clips in the PRISM Board.
-10. Approve, reject, or request revisions.
-11. Render approved clips.
+9. Review section outputs in the Outputs board.
+10. Approve or reject outputs.
+11. Render approved outputs.
 12. Export the handoff ZIP.
 
 ## 5. Common Docker Commands
@@ -231,13 +236,21 @@ docker compose exec backend pytest
 
 Docker is still supported. If you want faster backend iteration outside Docker, use `uv` from the backend directory:
 
+Install FFmpeg on the host before using the render button with local Uvicorn:
+
+```bash
+sudo apt update
+sudo apt install ffmpeg
+ffmpeg -version
+```
+
 ```bash
 docker compose up -d postgres
 cd backend
 uv sync
 source .venv/bin/activate
 alembic upgrade head
-uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8101 --reload
 ```
 
 You can also run without activating the virtualenv:
@@ -246,7 +259,7 @@ You can also run without activating the virtualenv:
 docker compose up -d postgres
 cd backend
 uv run alembic upgrade head
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8101 --reload
 uv run pytest
 ```
 
@@ -279,6 +292,7 @@ Health: http://localhost:8100/api/health
 cd frontend
 npm install
 npm run dev
+VITE_PROXY_TARGET=http://localhost:8101 npm run dev
 ```
 
 When running the frontend locally outside Docker, the Vite dev server proxies `/api` to `http://localhost:8100`.
@@ -347,9 +361,12 @@ AZURE_API_KEY=...
 AZURE_DEPLOYMENT=...
 ```
 
-If rendering fails, check backend logs. FFmpeg is installed inside the backend Docker image:
+If an audio transcript upload is skipped, set `OPENAI_API_KEY` to enable OpenAI Whisper transcription or set `AZURE_OPENAI_TRANSCRIPTION_DEPLOYMENT` with the Azure endpoint and key.
+
+If rendering fails, check backend logs. FFmpeg is installed inside the backend Docker image. For local Uvicorn, confirm `ffmpeg` is installed on the host:
 
 ```bash
+command -v ffmpeg
 docker compose logs -f backend
 ```
 

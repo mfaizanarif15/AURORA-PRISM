@@ -17,7 +17,6 @@ def test_authenticates_configured_user_and_verifies_token() -> None:
         auth_username="operator",
         auth_password="correct-password",
         auth_display_name="Operator One",
-        auth_role="Reviewer",
         auth_session_secret="test-secret",
     )
 
@@ -31,7 +30,6 @@ def test_authenticates_configured_user_and_verifies_token() -> None:
     assert expires_at > 0
     assert verified.id == "configured-admin"
     assert verified.username == "operator"
-    assert verified.role == "Reviewer"
 
 
 def test_rejects_bad_credentials_and_tampered_token() -> None:

@@ -14,7 +14,7 @@ from loguru import logger
 
 
 @dataclass(frozen=True)
-class EpisodeEvent:
+class AnalysisEvent:
     id: int
     episode_id: str
     event_type: str
@@ -26,11 +26,11 @@ class EpisodeEvent:
 
 
 _event_ids = count(1)
-_subscribers: dict[str, set[asyncio.Queue[EpisodeEvent]]] = defaultdict(set)
-_history: dict[str, deque[EpisodeEvent]] = defaultdict(lambda: deque(maxlen=80))
+_subscribers: dict[str, set[asyncio.Queue[AnalysisEvent]]] = defaultdict(set)
+_history: dict[str, deque[AnalysisEvent]] = defaultdict(lambda: deque(maxlen=80))
 
 
-async def publish_episode_event(
+async def publish_analysis_event(
     episode_id: str,
     event_type: str,
     message: str,
@@ -38,8 +38,8 @@ async def publish_episode_event(
     level: str = "info",
     progress: int | None = None,
     data: dict[str, Any] | None = None,
-) -> EpisodeEvent:
-    event = EpisodeEvent(
+) -> AnalysisEvent:
+    event = AnalysisEvent(
         id=next(_event_ids),
         episode_id=episode_id,
         event_type=event_type,
@@ -49,7 +49,7 @@ async def publish_episode_event(
         data=data or {},
     )
     _history[episode_id].append(event)
-    stale: list[asyncio.Queue[EpisodeEvent]] = []
+    stale: list[asyncio.Queue[AnalysisEvent]] = []
     for queue in list(_subscribers[episode_id]):
         try:
             queue.put_nowait(event)
@@ -58,7 +58,7 @@ async def publish_episode_event(
     for queue in stale:
         _subscribers[episode_id].discard(queue)
     logger.debug(
-        "Published episode event episode_id={} event_type={} subscriber_count={}",
+        "Published analysis event episode_id={} event_type={} subscriber_count={}",
         episode_id,
         event_type,
         len(_subscribers[episode_id]),
@@ -66,13 +66,20 @@ async def publish_episode_event(
     return event
 
 
-async def episode_event_stream(episode_id: str, request: Request) -> AsyncIterator[str]:
-    queue: asyncio.Queue[EpisodeEvent] = asyncio.Queue(maxsize=100)
+async def analysis_event_stream(
+    episode_id: str, request: Request, since: str | None = None
+) -> AsyncIterator[str]:
+    queue: asyncio.Queue[AnalysisEvent] = asyncio.Queue(maxsize=100)
     _subscribers[episode_id].add(queue)
-    logger.info("SSE client connected episode_id={} subscriber_count={}", episode_id, len(_subscribers[episode_id]))
+    logger.info(
+        "Analysis SSE client connected episode_id={} subscriber_count={}",
+        episode_id,
+        len(_subscribers[episode_id]),
+    )
     try:
         for event in list(_history[episode_id]):
-            yield _format_event(event)
+            if _is_after_since(event, since):
+                yield _format_event(event)
         yield _format_comment("connected")
         while not await request.is_disconnected():
             try:
@@ -84,15 +91,15 @@ async def episode_event_stream(episode_id: str, request: Request) -> AsyncIterat
     finally:
         _subscribers[episode_id].discard(queue)
         logger.info(
-            "SSE client disconnected episode_id={} subscriber_count={}",
+            "Analysis SSE client disconnected episode_id={} subscriber_count={}",
             episode_id,
             len(_subscribers[episode_id]),
         )
 
 
-def _format_event(event: EpisodeEvent) -> str:
+def _format_event(event: AnalysisEvent) -> str:
     payload = json.dumps(asdict(event), ensure_ascii=True, default=str)
-    return f"id: {event.id}\nevent: episode\ndata: {payload}\n\n"
+    return f"id: {event.id}\nevent: analysis\ndata: {payload}\n\n"
 
 
 def _format_comment(message: str) -> str:
@@ -103,3 +110,14 @@ def _normalize_progress(progress: int | None) -> int | None:
     if progress is None:
         return None
     return max(0, min(100, int(progress)))
+
+
+def _is_after_since(event: AnalysisEvent, since: str | None) -> bool:
+    if not since:
+        return True
+    try:
+        event_at = datetime.fromisoformat(event.created_at)
+        since_at = datetime.fromisoformat(since)
+    except ValueError:
+        return True
+    return event_at >= since_at

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -9,7 +8,7 @@ from statistics import mean
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -18,15 +17,21 @@ from app.models import (
     Asset,
     ClipCandidate,
     ClipMetadata,
-    ClipScore,
     Episode,
     EpisodeContext,
     TranscriptSegment,
 )
-from app.schemas.api import AnalysisRequest
-from app.services.ai_clients import chat_model_name, make_chat_client
+from app.schemas.api import ANALYSIS_SECTION_DURATION_DEFAULTS, AnalysisRequest
+from app.services.analysis_events import publish_analysis_event
 from app.services.audio import audio_confidence_for_range
-from app.services.events import publish_episode_event
+from app.services.llm import (
+    langfuse_llm_input as _langfuse_llm_input,
+    langfuse_llm_raw_output as _langfuse_llm_raw_output,
+    llm_response_summary as _llm_response_summary,
+    sha256_text as _sha256_text,
+    suggest_episode_title,
+    truncate_for_langfuse as _truncate_for_langfuse,
+)
 from app.services.observability import observation, safe_update
 from app.services.transcripts import seconds_to_timestamp
 
@@ -36,6 +41,7 @@ PLATFORM_LABELS = {
     "linkedin": "LinkedIn",
     "instagram_reels": "Instagram/Reels",
     "tiktok": "TikTok",
+    "generic": "Highlight",
 }
 
 MOMENT_TYPES = [
@@ -61,7 +67,9 @@ SCORE_KEYS = (
 LLM_PROMPT_VERSION = "clip-selection-json-v1"
 LLM_TEMPERATURE = 0.2
 LLM_MAX_TOKENS = 12000
-LLM_RESPONSE_FORMAT = {"type": "json_object"}
+SUPPORTING_DOCUMENT_ASSET_TYPES = {"guest_document", "brand_reference", "document", "supporting_document"}
+SUPPORTING_DOCUMENT_LIMIT = 5
+SUPPORTING_DOCUMENT_CHAR_LIMIT = 2400
 
 
 @dataclass
@@ -86,6 +94,8 @@ class DraftClip:
     excerpt: str
     reasoning: str
     score_parts: dict[str, int]
+    target_platform: str = "generic"
+    purpose: str = "Generic"
     metadata_by_platform: dict[str, PlatformMetadataDraft] = field(default_factory=dict)
 
     @property
@@ -97,33 +107,22 @@ class DraftClip:
         return round(self.end_seconds - self.start_seconds, 3)
 
 
-@dataclass
-class ChatCompletionResult:
-    completion: Any
-    response_format: str
-    retry_count: int = 0
-    response_format_error: str | None = None
-
-
 async def analyze_episode(
     session: AsyncSession, episode_id: str, request: AnalysisRequest
 ) -> AnalysisRun:
     logger.info(
-        "Starting analysis episode_id={} mode={} provider={} clip_types={} target_clip_count={}",
+        "Starting section analysis episode_id={} mode={} provider={} sections={}",
         episode_id,
         request.mode,
         request.ai_provider,
-        request.clip_types,
-        request.target_clip_count,
+        {key: config.target_count for key, config in request.enabled_sections()},
     )
     with observation(
         "analyze_episode",
         as_type="span",
         input={
             "episode_id": episode_id,
-            "clip_types": request.clip_types,
-            "target_clip_count": request.target_clip_count,
-            "platforms": request.platforms,
+            "sections": {key: config.target_count for key, config in request.enabled_sections()},
             "ai_provider": request.ai_provider,
             "mode": request.mode,
         },
@@ -133,10 +132,10 @@ async def analyze_episode(
         if episode is None:
             logger.warning("Analysis failed, episode not found episode_id={}", episode_id)
             raise ValueError("Episode not found")
-        await publish_episode_event(
+        await publish_analysis_event(
             episode_id,
             "analysis.started",
-            "Analysis started",
+            "Preparing transcript and context",
             progress=10,
             data={"mode": request.mode, "provider": request.ai_provider},
         )
@@ -146,21 +145,32 @@ async def analyze_episode(
         if not segments:
             logger.warning("Analysis failed, transcript missing episode_id={}", episode_id)
             raise ValueError("Transcript is required before analysis")
+        supporting_documents = await _get_supporting_documents(session, episode_id)
         logger.debug(
-            "Analysis input loaded episode_id={} has_context={} transcript_segments={}",
+            "Analysis input loaded episode_id={} has_context={} transcript_segments={} supporting_documents={}",
             episode_id,
             context is not None,
             len(segments),
+            len(supporting_documents),
+        )
+        await publish_analysis_event(
+            episode_id,
+            "analysis.inputs_loaded",
+            "Transcript and context loaded",
+            progress=20,
+            data={
+                "segment_count": len(segments),
+                "has_context": context is not None,
+                "supporting_document_count": len(supporting_documents),
+            },
         )
 
-        await session.execute(delete(ClipCandidate).where(ClipCandidate.episode_id == episode_id))
-        logger.debug("Cleared existing clip candidates episode_id={}", episode_id)
         run = AnalysisRun(
             episode_id=episode_id,
             mode=request.mode,
             status="running",
             request=request.model_dump(),
-            summary=f"Finding short-form and highlight candidates with {request.ai_provider}.",
+            summary="Finding section-specific outputs with Azure OpenAI specialists.",
         )
         session.add(run)
         await session.flush()
@@ -168,22 +178,34 @@ async def analyze_episode(
 
         media_path = await _primary_audio_path(session, episode_id)
         logger.debug("Primary media path resolved episode_id={} media_path={}", episode_id, media_path)
-        heuristic_drafts = _generate_drafts(episode, context, segments, request, media_path)
-        await publish_episode_event(
+        heuristic_drafts = _generate_drafts(
+            episode, context, segments, request, media_path, supporting_documents
+        )
+        await publish_analysis_event(
             episode_id,
             "analysis.candidates",
             f"Shortlisted {len(heuristic_drafts)} candidate moments",
-            progress=25,
+            progress=35,
             data={"candidate_count": len(heuristic_drafts)},
         )
         try:
-            drafts, analysis_source = await _drafts_for_request(
+            from app.services.analysis_graph import run_section_analysis
+
+            await publish_analysis_event(
+                episode_id,
+                "analysis.section_specialists",
+                "Running section specialists",
+                progress=55,
+                data={"sections": [key for key, _ in request.enabled_sections()]},
+            )
+            drafts, analysis_source = await run_section_analysis(
                 episode,
                 context,
                 segments,
                 request,
                 media_path,
                 heuristic_drafts,
+                supporting_documents,
             )
         except Exception as exc:
             run.status = "failed"
@@ -194,14 +216,6 @@ async def analyze_episode(
                 metadata={"error": type(exc).__name__, "message": str(exc)},
             )
             logger.exception("Analysis failed episode_id={} analysis_run_id={} error={}", episode_id, run.id, exc)
-            await publish_episode_event(
-                episode_id,
-                "analysis.failed",
-                str(exc),
-                level="error",
-                progress=100,
-                data={"analysis_run_id": run.id, "error_type": type(exc).__name__},
-            )
             raise ValueError(f"Analysis failed: {exc}") from exc
 
         logger.info(
@@ -211,12 +225,50 @@ async def analyze_episode(
             len(drafts),
             analysis_source,
         )
+        generated_title = None
+        if _should_auto_title_episode(episode):
+            await publish_analysis_event(
+                episode_id,
+                "analysis.title_generation",
+                "Generating episode title",
+                progress=75,
+                data={"provider": request.ai_provider},
+            )
+            original_title = episode.title
+            episode.title = await suggest_episode_title(
+                episode,
+                context,
+                segments[:8],
+                request.ai_provider,
+            )
+            if episode.title != original_title:
+                generated_title = episode.title
+                logger.info(
+                    "Analysis generated episode title episode_id={} title={}",
+                    episode_id,
+                    generated_title,
+                )
 
+        await publish_analysis_event(
+            episode_id,
+            "analysis.saving",
+            "Saving recommended outputs",
+            progress=85,
+            data={"draft_count": len(drafts), "analysis_source": analysis_source},
+        )
+
+        rank_offsets = await _section_rank_offsets(session, episode_id)
         for rank, draft in enumerate(drafts, start=1):
+            purpose_rank = 1 + sum(
+                1 for item in drafts[: rank - 1] if item.target_platform == draft.target_platform
+            )
+            purpose_rank += rank_offsets.get(draft.target_platform, 0)
             clip = ClipCandidate(
                 episode_id=episode_id,
                 analysis_run_id=run.id,
                 clip_type=draft.clip_type,
+                target_platform=draft.target_platform,
+                purpose=draft.purpose,
                 moment_type=draft.moment_type,
                 status="recommended",
                 start_seconds=draft.start_seconds,
@@ -224,19 +276,19 @@ async def analyze_episode(
                 duration_seconds=draft.duration_seconds,
                 excerpt=draft.excerpt,
                 reasoning=draft.reasoning,
-                rank=rank,
+                rank=purpose_rank,
             )
             session.add(clip)
             await session.flush()
-            session.add(_score_from_draft(clip.id, draft))
-            for platform in request.platforms:
+            metadata_platforms = list(draft.metadata_by_platform) or [draft.target_platform]
+            for platform in metadata_platforms:
                 session.add(_metadata_for_clip(clip.id, platform, episode, context, draft))
 
         episode.status = "analyzed"
         run.status = "completed"
         run.summary = (
-            f"Generated {len(drafts)} recommended clips across {', '.join(request.clip_types)} "
-            f"using {analysis_source}."
+            f"Generated {len(drafts)} section outputs across "
+            f"{', '.join(key for key, _ in request.enabled_sections())} using {analysis_source}."
         )
         await session.commit()
         await session.refresh(run)
@@ -246,282 +298,16 @@ async def analyze_episode(
             run.id,
             len(drafts),
         )
-        await publish_episode_event(
-            episode_id,
-            "analysis.saved",
-            f"Saved {len(drafts)} clips",
-            level="success",
-            progress=95,
-            data={"analysis_run_id": run.id, "analysis_source": analysis_source, "clip_count": len(drafts)},
-        )
         safe_update(
             span,
             output={
                 "analysis_run_id": run.id,
                 "generated_clip_count": len(drafts),
-                "top_score": drafts[0].total_score if drafts else None,
                 "analysis_source": analysis_source,
+                "generated_title": generated_title,
             },
         )
         return run
-
-
-async def _drafts_for_request(
-    episode: Episode,
-    context: EpisodeContext | None,
-    segments: list[TranscriptSegment],
-    request: AnalysisRequest,
-    media_path: Path | None,
-    heuristic_drafts: list[DraftClip],
-) -> tuple[list[DraftClip], str]:
-    sorted_heuristic = sorted(heuristic_drafts, key=lambda item: item.total_score, reverse=True)
-    if request.mode == "mock":
-        await publish_episode_event(
-            episode.id,
-            "analysis.heuristic",
-            "Using local heuristic scoring",
-            progress=75,
-            data={"candidate_count": len(sorted_heuristic)},
-        )
-        return sorted_heuristic[: request.target_clip_count], "heuristic"
-
-    try:
-        llm_drafts = await _generate_llm_drafts(
-            episode,
-            context,
-            segments,
-            request,
-            media_path,
-            sorted_heuristic,
-        )
-    except Exception as exc:
-        if request.mode == "openai":
-            raise
-        logger.warning(
-            "LLM analysis failed in hybrid mode, falling back to heuristics episode_id={} error={}",
-            episode.id,
-            exc,
-        )
-        await publish_episode_event(
-            episode.id,
-            "analysis.fallback",
-            "LLM failed; using heuristic fallback",
-            level="warning",
-            progress=80,
-            data={"error": str(exc), "error_type": type(exc).__name__},
-        )
-        return sorted_heuristic[: request.target_clip_count], "heuristic_fallback"
-
-    if not llm_drafts:
-        if request.mode == "openai":
-            raise RuntimeError("LLM returned no clip candidates")
-        await publish_episode_event(
-            episode.id,
-            "analysis.fallback",
-            "LLM returned no clips; using heuristic fallback",
-            level="warning",
-            progress=80,
-        )
-        return sorted_heuristic[: request.target_clip_count], "heuristic_fallback"
-
-    combined = _complete_with_heuristics(llm_drafts, sorted_heuristic, request)
-    await publish_episode_event(
-        episode.id,
-        "analysis.llm_completed",
-        f"LLM selected {len(llm_drafts)} clips",
-        level="success",
-        progress=85,
-        data={"llm_clip_count": len(llm_drafts), "final_clip_count": len(combined[: request.target_clip_count])},
-    )
-    return combined[: request.target_clip_count], f"llm:{request.ai_provider}"
-
-
-async def _generate_llm_drafts(
-    episode: Episode,
-    context: EpisodeContext | None,
-    segments: list[TranscriptSegment],
-    request: AnalysisRequest,
-    media_path: Path | None,
-    heuristic_drafts: list[DraftClip],
-) -> list[DraftClip]:
-    settings = get_settings()
-    client = make_chat_client(settings, request.ai_provider)
-    model = chat_model_name(settings, request.ai_provider)
-    candidates, candidate_map = _llm_candidate_payloads(heuristic_drafts, request)
-    if not candidates:
-        raise RuntimeError("No candidate moments are available for LLM analysis")
-
-    payload = {
-        "episode": _episode_payload(episode),
-        "context": _context_payload(context),
-        "request": request.model_dump(),
-        "transcript": {
-            "segment_count": len(segments),
-            "duration_seconds": round(segments[-1].end_seconds, 3) if segments else 0,
-        },
-        "candidate_moments": candidates,
-    }
-    messages = [
-        {"role": "system", "content": _llm_system_prompt()},
-        {"role": "user", "content": _llm_user_prompt(payload)},
-    ]
-    trace_metadata = {
-        "episode_id": episode.id,
-        "episode_title": episode.title,
-        "operation": "analysis_llm",
-        "provider": request.ai_provider,
-        "prompt_version": LLM_PROMPT_VERSION,
-        "target_clip_count": request.target_clip_count,
-        "candidate_count": len(candidates),
-        "platforms": request.platforms,
-        "capture_llm_io": settings.langfuse_capture_llm_io,
-    }
-
-    with observation(
-        "llm_clip_analysis",
-        as_type="generation",
-        input=_langfuse_llm_input(settings, messages, payload),
-        metadata=trace_metadata,
-        model=model,
-        model_parameters=_llm_model_parameters(),
-        version=LLM_PROMPT_VERSION,
-    ) as span:
-        logger.info(
-            "Calling LLM for clip analysis episode_id={} provider={} model={} candidate_count={}",
-            episode.id,
-            request.ai_provider,
-            model,
-            len(candidates),
-        )
-        await publish_episode_event(
-            episode.id,
-            "llm.started",
-            f"Calling {request.ai_provider.replace('_', ' ')}",
-            progress=45,
-            data={"model": model, "candidate_count": len(candidates), "platforms": request.platforms},
-        )
-        completion_result = await _create_chat_completion(client, model, messages)
-        completion = completion_result.completion
-        choice = completion.choices[0]
-        finish_reason = getattr(choice, "finish_reason", None)
-        content = choice.message.content or "{}"
-        completion_metadata = _without_none(
-            {
-                **trace_metadata,
-                **_completion_metadata(completion),
-                "finish_reason": finish_reason,
-                "response_format": completion_result.response_format,
-                "retry_count": completion_result.retry_count,
-                "response_format_error": completion_result.response_format_error,
-                "raw_response_length": len(content),
-                "raw_response_sha256": _sha256_text(content),
-            }
-        )
-        safe_update(
-            span,
-            output=_langfuse_llm_raw_output(settings, content, finish_reason),
-            usage_details=_llm_usage_details(completion),
-            metadata=completion_metadata,
-        )
-        logger.info(
-            "LLM clip analysis response received episode_id={} finish_reason={} content_length={}",
-            episode.id,
-            finish_reason,
-            len(content),
-        )
-        await publish_episode_event(
-            episode.id,
-            "llm.response",
-            "LLM response received",
-            progress=70,
-            data={"finish_reason": finish_reason, "content_length": len(content)},
-        )
-        response_payload = _load_json_response(content)
-        drafts = _drafts_from_llm_response(response_payload, candidate_map, request, media_path)
-        safe_update(
-            span,
-            output=_langfuse_llm_output(settings, content, response_payload, drafts, finish_reason),
-            metadata={**completion_metadata, "parsed_clip_count": len(drafts)},
-        )
-        logger.info("LLM clip analysis completed episode_id={} clip_count={}", episode.id, len(drafts))
-        await publish_episode_event(
-            episode.id,
-            "llm.parsed",
-            f"Parsed {len(drafts)} LLM clips",
-            progress=80,
-            data={"clip_count": len(drafts)},
-        )
-        return drafts
-
-
-async def _create_chat_completion(client, model: str, messages: list[dict[str, str]]) -> ChatCompletionResult:
-    kwargs = {
-        "model": model,
-        "messages": messages,
-        "temperature": LLM_TEMPERATURE,
-        "max_tokens": LLM_MAX_TOKENS,
-    }
-    try:
-        completion = await client.chat.completions.create(
-            **kwargs,
-            response_format=LLM_RESPONSE_FORMAT,
-        )
-        return ChatCompletionResult(completion=completion, response_format="json_object")
-    except Exception as exc:
-        if "response_format" not in str(exc).lower():
-            raise
-        logger.warning("Retrying LLM call without JSON response_format error={}", exc)
-        completion = await client.chat.completions.create(**kwargs)
-        return ChatCompletionResult(
-            completion=completion,
-            response_format="provider_default",
-            retry_count=1,
-            response_format_error=_clip_text(str(exc), 1200),
-        )
-
-
-def _llm_model_parameters() -> dict[str, Any]:
-    return {
-        "temperature": LLM_TEMPERATURE,
-        "max_tokens": LLM_MAX_TOKENS,
-        "response_format": LLM_RESPONSE_FORMAT["type"],
-    }
-
-
-def _langfuse_llm_input(settings: Any, messages: list[dict[str, str]], payload: dict[str, Any]) -> dict[str, Any]:
-    if not settings.langfuse_capture_llm_io:
-        return {
-            "capture_disabled": True,
-            "messages": [_message_digest(message) for message in messages],
-            "payload_summary": _llm_payload_summary(payload),
-        }
-    return _truncate_for_langfuse(
-        {
-            "messages": messages,
-            "prompt_payload": payload,
-        },
-        settings.langfuse_max_llm_io_chars,
-    )
-
-
-def _langfuse_llm_raw_output(settings: Any, content: str, finish_reason: str | None) -> dict[str, Any]:
-    if not settings.langfuse_capture_llm_io:
-        return {
-            "capture_disabled": True,
-            "assistant_message": {
-                "role": "assistant",
-                "content_length": len(content),
-                "content_sha256": _sha256_text(content),
-            },
-            "finish_reason": finish_reason,
-        }
-    return _truncate_for_langfuse(
-        {
-            "assistant_message": {"role": "assistant", "content": content},
-            "finish_reason": finish_reason,
-        },
-        settings.langfuse_max_llm_io_chars,
-    )
 
 
 def _langfuse_llm_output(
@@ -544,39 +330,6 @@ def _langfuse_llm_output(
     return _truncate_for_langfuse(output, settings.langfuse_max_llm_io_chars)
 
 
-def _message_digest(message: dict[str, str]) -> dict[str, Any]:
-    content = message.get("content", "")
-    return {
-        "role": message.get("role"),
-        "content_length": len(content),
-        "content_sha256": _sha256_text(content),
-    }
-
-
-def _llm_payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    candidates = payload.get("candidate_moments")
-    candidate_items = candidates if isinstance(candidates, list) else []
-    return {
-        "episode": payload.get("episode"),
-        "request": payload.get("request"),
-        "transcript": payload.get("transcript"),
-        "candidate_count": len(candidate_items),
-        "candidate_ids": [candidate.get("id") for candidate in candidate_items if isinstance(candidate, dict)],
-    }
-
-
-def _llm_response_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_clips = payload.get("clips") if isinstance(payload, dict) else None
-    clips = raw_clips if isinstance(raw_clips, list) else []
-    return {
-        "clip_count": len(clips),
-        "summary": payload.get("summary") if isinstance(payload, dict) else None,
-        "source_candidate_ids": [
-            clip.get("source_candidate_id") for clip in clips if isinstance(clip, dict)
-        ],
-    }
-
-
 def _draft_clip_trace_payload(draft: DraftClip, *, capture_content: bool) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "clip_type": draft.clip_type,
@@ -584,8 +337,6 @@ def _draft_clip_trace_payload(draft: DraftClip, *, capture_content: bool) -> dic
         "start_seconds": draft.start_seconds,
         "end_seconds": draft.end_seconds,
         "duration_seconds": draft.duration_seconds,
-        "total_score": draft.total_score,
-        "score_parts": draft.score_parts,
         "platforms": list(draft.metadata_by_platform.keys()),
     }
     if not capture_content:
@@ -626,60 +377,20 @@ def _platform_metadata_trace_payload(metadata: PlatformMetadataDraft) -> dict[st
     }
 
 
-def _completion_metadata(completion: Any) -> dict[str, Any]:
-    metadata: dict[str, Any] = {}
-    for key in ("id", "created", "model", "system_fingerprint"):
-        value = getattr(completion, key, None)
-        if value is not None:
-            metadata[f"completion_{key}"] = value
-    return metadata
+def _should_auto_title_episode(episode: Episode) -> bool:
+    return episode.title.strip().lower() == "untitled episode"
 
 
-def _llm_usage_details(completion: Any) -> dict[str, int] | None:
-    usage = getattr(completion, "usage", None)
-    if usage is None:
-        return None
-
-    details = {
-        "input": _usage_int(usage, "prompt_tokens", "input_tokens"),
-        "output": _usage_int(usage, "completion_tokens", "output_tokens"),
-        "total": _usage_int(usage, "total_tokens"),
+async def _section_rank_offsets(session: AsyncSession, episode_id: str) -> dict[str, int]:
+    result = await session.execute(
+        select(ClipCandidate.target_platform, func.max(ClipCandidate.rank))
+        .where(ClipCandidate.episode_id == episode_id)
+        .group_by(ClipCandidate.target_platform)
+    )
+    return {
+        str(target_platform): int(max_rank or 0)
+        for target_platform, max_rank in result.all()
     }
-    cleaned = {key: value for key, value in details.items() if value is not None}
-    return cleaned or None
-
-
-def _usage_int(usage: Any, *names: str) -> int | None:
-    for name in names:
-        value = getattr(usage, name, None)
-        if isinstance(value, int):
-            return value
-    return None
-
-
-def _without_none(values: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in values.items() if value is not None}
-
-
-def _truncate_for_langfuse(value: Any, max_chars: int) -> Any:
-    if isinstance(value, str):
-        return _truncate_trace_text(value, max_chars)
-    if isinstance(value, list):
-        return [_truncate_for_langfuse(item, max_chars) for item in value]
-    if isinstance(value, dict):
-        return {key: _truncate_for_langfuse(item, max_chars) for key, item in value.items()}
-    return value
-
-
-def _truncate_trace_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    omitted = len(text) - max_chars
-    return f"{text[:max_chars]}\n...[truncated {omitted} chars]"
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _generate_drafts(
@@ -688,8 +399,9 @@ def _generate_drafts(
     segments: list[TranscriptSegment],
     request: AnalysisRequest,
     media_path: Path | None,
+    supporting_documents: list[Asset],
 ) -> list[DraftClip]:
-    terms = _context_terms(episode, context, request)
+    terms = _context_terms(episode, context, request, supporting_documents)
     logger.debug(
         "Generating drafts episode_id={} context_term_count={} segment_count={}",
         episode.id,
@@ -697,11 +409,10 @@ def _generate_drafts(
         len(segments),
     )
     seed_scores = [(_segment_signal(segment, terms), index) for index, segment in enumerate(segments)]
-    seed_scores = sorted(seed_scores, reverse=True)[: max(12, request.target_clip_count * 3)]
+    seed_scores = sorted(seed_scores, reverse=True)[: max(12, _max_section_count(request) * 6)]
     drafts: list[DraftClip] = []
 
-    for clip_type in request.clip_types:
-        min_duration, max_duration = _duration_range(clip_type, request)
+    for clip_type, min_duration, max_duration in _request_clip_windows(request):
         for signal, index in seed_scores:
             if signal < 1:
                 continue
@@ -741,6 +452,45 @@ def _generate_drafts(
     return drafts
 
 
+def _request_clip_types(request: AnalysisRequest) -> list[str]:
+    if request.sections:
+        clip_types: list[str] = []
+        if any(key != "highlights" and config.enabled for key, config in request.sections.items()):
+            clip_types.append("short")
+        if request.sections.get("highlights") and request.sections["highlights"].enabled:
+            clip_types.append("highlight")
+        return clip_types or ["short"]
+    return list(request.clip_types)
+
+
+def _request_clip_windows(request: AnalysisRequest) -> list[tuple[str, int, int]]:
+    if not request.sections:
+        return [(clip_type, *_duration_range(clip_type, request)) for clip_type in request.clip_types]
+
+    windows: list[tuple[str, int, int]] = []
+    for key, config in request.enabled_sections():
+        clip_type = "highlight" if key == "highlights" else "short"
+        min_duration, max_duration = ANALYSIS_SECTION_DURATION_DEFAULTS[key]
+        if request.duration_min_seconds and request.duration_max_seconds:
+            min_duration = request.duration_min_seconds
+            max_duration = request.duration_max_seconds
+        if config.duration_min_seconds is not None:
+            min_duration = config.duration_min_seconds
+        if config.duration_max_seconds is not None:
+            max_duration = config.duration_max_seconds
+        windows.append((clip_type, min_duration, max_duration))
+
+    # Build broader source windows first. Shorter sections can trim longer candidates, but a
+    # too-short source cannot satisfy longer custom durations.
+    ordered = sorted(dict.fromkeys(windows), key=lambda item: (item[0] != "highlight", item[1]), reverse=True)
+    return ordered or [("short", 30, 90)]
+
+
+def _max_section_count(request: AnalysisRequest) -> int:
+    counts = [config.target_count for _, config in request.enabled_sections()]
+    return max(counts) if counts else request.target_clip_count
+
+
 def _llm_candidate_payloads(
     drafts: list[DraftClip], request: AnalysisRequest
 ) -> tuple[list[dict[str, Any]], dict[str, DraftClip]]:
@@ -760,8 +510,6 @@ def _llm_candidate_payloads(
                 "duration_seconds": draft.duration_seconds,
                 "excerpt": _clip_text(draft.excerpt, 1200),
                 "heuristic_reasoning": draft.reasoning,
-                "heuristic_total_score": draft.total_score,
-                "heuristic_score_parts": draft.score_parts,
             }
         )
     return candidates, candidate_map
@@ -775,7 +523,6 @@ def _episode_payload(episode: Episode) -> dict[str, Any]:
         "guest_role": episode.guest_role,
         "guest_company": episode.guest_company,
         "recording_date": episode.recording_date,
-        "theme": episode.theme,
     }
 
 
@@ -786,7 +533,6 @@ def _context_payload(context: EpisodeContext | None) -> dict[str, Any]:
         "icp": context.icp,
         "target_audience": context.target_audience,
         "audience_pain_points": context.audience_pain_points,
-        "tkxel_services": context.tkxel_services,
         "hot_topic": context.hot_topic,
         "business_objectives": context.business_objectives,
         "episode_plan": context.episode_plan,
@@ -795,12 +541,30 @@ def _context_payload(context: EpisodeContext | None) -> dict[str, Any]:
     }
 
 
+def _supporting_document_payloads(documents: list[Asset]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for asset in documents[:SUPPORTING_DOCUMENT_LIMIT]:
+        text = (asset.extracted_text or "").strip()
+        if not text:
+            continue
+        payloads.append(
+            {
+                "filename": asset.filename,
+                "asset_type": asset.asset_type,
+                "content_type": asset.content_type,
+                "text_excerpt": _clip_text(text, SUPPORTING_DOCUMENT_CHAR_LIMIT),
+            }
+        )
+    return payloads
+
+
 def _llm_system_prompt() -> str:
     return (
         "You are AURORA PRISM, an expert podcast clip strategist for B2B technology content. "
         "Select the moments most likely to perform as YouTube Shorts, TikTok clips, Instagram Reels, "
         "LinkedIn clips, and longer highlights. You optimize for strong hooks, audience relevance, "
         "business value, guest authority, factual safety, and clean standalone context. "
+        "Use supporting documents as background context only; selected clips must stay grounded in transcript moments. "
         "Return valid JSON only. Do not invent transcript claims or timestamps."
     )
 
@@ -816,7 +580,6 @@ def _llm_user_prompt(payload: dict[str, Any]) -> str:
                 "end_seconds": 183.0,
                 "excerpt": "Use or lightly trim the candidate transcript excerpt.",
                 "reasoning": "Why this moment should be clipped and who it serves.",
-                "score_parts": {key: 80 for key in SCORE_KEYS},
                 "platform_metadata": {
                     "youtube_shorts": {
                         "title": "Searchable, specific title under 95 characters",
@@ -850,10 +613,10 @@ def _llm_user_prompt(payload: dict[str, Any]) -> str:
         "- Return at most target_clip_count clips.\n"
         "- Prefer shorts that work in 30-90 seconds and highlights that work in 3-6 minutes unless custom durations are provided.\n"
         "- You may tighten timestamps by up to 5 seconds, but keep the selected moment inside the source candidate.\n"
+        "- Use supporting_documents when present to improve audience, positioning, and factual context.\n"
         "- Include platform_metadata for every requested platform.\n"
         "- Titles should be native to the platform, specific, and not clickbait.\n"
         "- Captions should preserve factual accuracy and avoid unsupported claims.\n"
-        "- All score_parts values must be integers from 0 to 100.\n\n"
         f"output_schema:\n{json.dumps(schema, ensure_ascii=True)}\n\n"
         f"input_json:\n{json.dumps(payload, ensure_ascii=True)}"
     )
@@ -1007,8 +770,6 @@ def _drafts_from_llm_response(
         if len(excerpt.split()) < 5:
             excerpt = source.excerpt
         moment_type = _safe_moment_type(str(raw.get("moment_type") or source.moment_type))
-        audio_score = audio_confidence_for_range(media_path, start, end)
-        score_parts = _normalize_score_parts(raw.get("score_parts"), source.score_parts, audio_score)
         metadata = _platform_metadata_from_llm(raw.get("platform_metadata"), request.platforms)
         draft = DraftClip(
             clip_type=clip_type,
@@ -1017,7 +778,7 @@ def _drafts_from_llm_response(
             end_seconds=round(end, 3),
             excerpt=excerpt,
             reasoning=_clip_text(str(raw.get("reasoning") or source.reasoning), 700),
-            score_parts=score_parts,
+            score_parts=source.score_parts,
             metadata_by_platform=metadata,
         )
         if not _is_duplicate_window(drafts, draft.clip_type, draft.start_seconds, draft.end_seconds):
@@ -1064,18 +825,6 @@ def _safe_moment_type(value: str) -> str:
     normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
     allowed = {moment_type for moment_type, _ in MOMENT_TYPES}
     return normalized if normalized in allowed else "expert_insight"
-
-
-def _normalize_score_parts(
-    value: object, fallback: dict[str, int], audio_score: int
-) -> dict[str, int]:
-    raw = value if isinstance(value, dict) else {}
-    normalized: dict[str, int] = {}
-    for key in SCORE_KEYS:
-        default = audio_score if key == "audio_confidence" else fallback.get(key, 65)
-        normalized[key] = _bounded(_coerce_int(raw.get(key), default))
-    normalized["audio_confidence"] = audio_score
-    return normalized
 
 
 def _platform_metadata_from_llm(
@@ -1149,13 +898,6 @@ def _coerce_float(value: object, fallback: float) -> float:
         return fallback
 
 
-def _coerce_int(value: object, fallback: int) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return fallback
-
-
 def _duration_range(clip_type: str, request: AnalysisRequest) -> tuple[int, int]:
     if request.duration_min_seconds and request.duration_max_seconds:
         return request.duration_min_seconds, request.duration_max_seconds
@@ -1199,38 +941,17 @@ def _score_parts(
     hook_words = sum(1 for word in ["why", "how", "problem", "risk", "future", "mistake", "cost"] if word in lower)
     platform_bonus = 6 if clip_type == "short" and {"tiktok", "youtube_shorts"} & set(request.platforms) else 3
     instruction_bonus = 8 if request.custom_instructions and _matches_text(lower, request.custom_instructions) else 0
-    service_bonus = 10 if context and context.tkxel_services and _matches_text(lower, context.tkxel_services) else 0
     topic_bonus = 12 if context and context.hot_topic and _matches_text(lower, context.hot_topic) else 4
     return {
         "icp_relevance": _bounded(58 + signal * 4 + instruction_bonus),
-        "tkxel_alignment": _bounded(55 + service_bonus + signal * 2),
+        "tkxel_alignment": _bounded(55 + signal * 2),
         "hook_strength": _bounded(52 + hook_words * 7 + platform_bonus),
         "virality_potential": _bounded(54 + hook_words * 5 + (8 if clip_type == "short" else 2)),
-        "business_value": _bounded(58 + signal * 3 + service_bonus),
+        "business_value": _bounded(58 + signal * 3),
         "guest_authority": _bounded(68 + (6 if "founder" in lower or "chief" in lower else 0)),
         "topic_fit": _bounded(56 + topic_bonus + signal * 3),
         "audio_confidence": audio_score,
     }
-
-
-def _score_from_draft(clip_id: str, draft: DraftClip) -> ClipScore:
-    parts = draft.score_parts
-    return ClipScore(
-        clip_id=clip_id,
-        total_score=draft.total_score,
-        icp_relevance=parts["icp_relevance"],
-        tkxel_alignment=parts["tkxel_alignment"],
-        hook_strength=parts["hook_strength"],
-        virality_potential=parts["virality_potential"],
-        business_value=parts["business_value"],
-        guest_authority=parts["guest_authority"],
-        topic_fit=parts["topic_fit"],
-        audio_confidence=parts["audio_confidence"],
-        explanation=(
-            "Score blends business/context relevance, hook potential, platform fit, guest authority, "
-            "and audio confidence around the selected timestamp."
-        ),
-    )
 
 
 def _metadata_for_clip(
@@ -1257,14 +978,14 @@ def _metadata_for_clip(
         )
 
     platform_label = PLATFORM_LABELS.get(platform, platform.replace("_", " ").title())
-    theme = context.hot_topic if context and context.hot_topic else episode.theme or "AI strategy"
-    title = _title_for(draft, theme)
+    topic = context.hot_topic if context and context.hot_topic else "AI strategy"
+    title = _title_for(draft, topic)
     hook = f"What if the strongest moment in this conversation is the part most teams overlook?"
     if draft.clip_type == "highlight":
-        hook = f"A deeper cut from {episode.guest_name or 'the guest'} on {theme}."
+        hook = f"A deeper cut from {episode.guest_name or 'the guest'} on {topic}."
     caption = (
         f"{title}\n\n{_clip_text(draft.excerpt, 280)}\n\n"
-        f"Built for {platform_label} with a focus on {theme}."
+        f"Built for {platform_label} with a focus on {topic}."
     )
     return ClipMetadata(
         clip_id=clip_id,
@@ -1274,7 +995,7 @@ def _metadata_for_clip(
         caption=caption,
         soft_cta="Watch the full BetterTech conversation for the broader context.",
         business_cta="Talk to TKXEL about turning AI strategy into practical product outcomes.",
-        hashtags=_hashtags(theme, platform),
+        hashtags=_hashtags(topic, platform),
         pinned_comment="Which part of this take should technology leaders debate next?",
         thumbnail_concepts=[
             {
@@ -1307,6 +1028,23 @@ async def _get_segments(session: AsyncSession, episode_id: str) -> list[Transcri
     return segments
 
 
+async def _get_supporting_documents(session: AsyncSession, episode_id: str) -> list[Asset]:
+    result = await session.execute(
+        select(Asset)
+        .where(
+            Asset.episode_id == episode_id,
+            Asset.asset_type.in_(SUPPORTING_DOCUMENT_ASSET_TYPES),
+            Asset.extracted_text.is_not(None),
+            Asset.extracted_text != "",
+        )
+        .order_by(Asset.created_at.desc())
+        .limit(SUPPORTING_DOCUMENT_LIMIT)
+    )
+    documents = list(result.scalars())
+    logger.debug("Loaded supporting documents episode_id={} count={}", episode_id, len(documents))
+    return documents
+
+
 async def _primary_audio_path(session: AsyncSession, episode_id: str) -> Path | None:
     result = await session.execute(
         select(Asset)
@@ -1320,25 +1058,26 @@ async def _primary_audio_path(session: AsyncSession, episode_id: str) -> Path | 
 
 
 def _context_terms(
-    episode: Episode, context: EpisodeContext | None, request: AnalysisRequest
+    episode: Episode,
+    context: EpisodeContext | None,
+    request: AnalysisRequest,
+    supporting_documents: list[Asset] | None = None,
 ) -> set[str]:
-    raw = " ".join(
-        item or ""
-        for item in [
-            episode.title,
-            episode.theme,
-            episode.guest_role,
-            episode.guest_company,
-            context.icp if context else None,
-            context.target_audience if context else None,
-            context.audience_pain_points if context else None,
-            context.tkxel_services if context else None,
-            context.hot_topic if context else None,
-            context.business_objectives if context else None,
-            context.episode_plan if context else None,
-            request.custom_instructions,
-        ]
-    )
+    context_items = [
+        episode.title,
+        episode.guest_role,
+        episode.guest_company,
+        context.icp if context else None,
+        context.target_audience if context else None,
+        context.audience_pain_points if context else None,
+        context.hot_topic if context else None,
+        context.business_objectives if context else None,
+        context.episode_plan if context else None,
+        request.custom_instructions,
+    ]
+    if supporting_documents:
+        context_items.extend(asset.extracted_text for asset in supporting_documents)
+    raw = " ".join(item or "" for item in context_items)
     return {word for word in re.findall(r"[a-zA-Z][a-zA-Z0-9-]{3,}", raw.lower()) if word not in _STOPWORDS}
 
 
@@ -1380,7 +1119,7 @@ def _reasoning(
     clip_type: str, moment_type: str, excerpt: str, context: EpisodeContext | None, request: AnalysisRequest
 ) -> str:
     duration_label = "short-form social clip" if clip_type == "short" else "3-6 minute highlight"
-    topic = context.hot_topic if context and context.hot_topic else "the selected episode theme"
+    topic = context.hot_topic if context and context.hot_topic else "the selected hot topic"
     instruction = f" It also reflects the custom instruction: {request.custom_instructions}" if request.custom_instructions else ""
     return (
         f"Recommended as a {duration_label} because it reads as {moment_type.replace('_', ' ')} "
@@ -1404,18 +1143,18 @@ def _matches_text(excerpt: str, source: str) -> bool:
     return any(term in excerpt for term in terms[:20])
 
 
-def _title_for(draft: DraftClip, theme: str) -> str:
+def _title_for(draft: DraftClip, topic: str) -> str:
     if draft.clip_type == "highlight":
-        return f"The deeper BetterTech take on {theme}"[:95]
+        return f"The deeper BetterTech take on {topic}"[:95]
     if draft.moment_type == "hot_take":
-        return f"The uncomfortable truth about {theme}"[:95]
+        return f"The uncomfortable truth about {topic}"[:95]
     if draft.moment_type == "future_prediction":
-        return f"What happens next in {theme}"[:95]
-    return f"A sharp BetterTech insight on {theme}"[:95]
+        return f"What happens next in {topic}"[:95]
+    return f"A sharp BetterTech insight on {topic}"[:95]
 
 
-def _hashtags(theme: str, platform: str) -> list[str]:
-    words = [word.title() for word in re.findall(r"[A-Za-z][A-Za-z0-9]+", theme)[:3]]
+def _hashtags(topic: str, platform: str) -> list[str]:
+    words = [word.title() for word in re.findall(r"[A-Za-z][A-Za-z0-9]+", topic)[:3]]
     base = ["BetterTech", "AI", "TechLeadership"]
     if platform == "linkedin":
         base.append("DigitalTransformation")

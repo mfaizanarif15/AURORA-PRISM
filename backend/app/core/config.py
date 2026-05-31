@@ -21,10 +21,19 @@ class Settings(BaseSettings):
     ai_provider: str = Field(default="azure_openai", validation_alias=AliasChoices("AI_PROVIDER", "OPENAI_PROVIDER"))
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
+    openai_transcription_model: str = "whisper-1"
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_api_version: str | None = "2025-03-01-preview"
     azure_openai_chat_deployment: str | None = None
+    azure_openai_transcription_deployment: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_TRANSCRIPTION_DEPLOYMENT",
+            "AZURE_OPENAI_AUDIO_DEPLOYMENT",
+            "AZURE_OPENAI_WHISPER_DEPLOYMENT",
+        ),
+    )
     azure_openai_embedding_deployment: str | None = "text-embedding-3-large"
     azure_api_base: str | None = None
     azure_api_key: str | None = None
@@ -39,6 +48,7 @@ class Settings(BaseSettings):
     langfuse_release: str | None = "aurora-prism-mvp"
     langfuse_capture_llm_io: bool = True
     langfuse_max_llm_io_chars: int = 250000
+    llm_analysis_parallelism: int = 4
     log_level: str = "INFO"
     log_to_file: bool = True
     log_file: Path | None = None
@@ -47,7 +57,6 @@ class Settings(BaseSettings):
     auth_username: str = "admin"
     auth_password: str = "aurora-admin"
     auth_display_name: str = "AURORA Operator"
-    auth_role: str = "Content Operations"
     auth_session_secret: str = "aurora-prism-local-session-secret"
     auth_token_ttl_minutes: int = 480
 
@@ -81,6 +90,11 @@ class Settings(BaseSettings):
         if normalized in {"false", "0", "no", "n", "off", "live", "openai", "azure_openai"}:
             return False
         return True
+
+    @field_validator("openai_transcription_model")
+    @classmethod
+    def normalize_openai_transcription_model(cls, value: str) -> str:
+        return value.strip() or "whisper-1"
 
     @field_validator("storage_root")
     @classmethod
@@ -120,6 +134,11 @@ class Settings(BaseSettings):
     def normalize_langfuse_max_llm_io_chars(cls, value: int) -> int:
         return max(1000, value)
 
+    @field_validator("llm_analysis_parallelism")
+    @classmethod
+    def normalize_llm_analysis_parallelism(cls, value: int) -> int:
+        return max(1, min(16, value))
+
     @property
     def uploads_dir(self) -> Path:
         return self.storage_root / "uploads"
@@ -147,6 +166,10 @@ class Settings(BaseSettings):
     @property
     def resolved_azure_openai_chat_deployment(self) -> str | None:
         return self.azure_openai_chat_deployment or self.azure_deployment
+
+    @property
+    def resolved_azure_openai_transcription_deployment(self) -> str | None:
+        return self.azure_openai_transcription_deployment
 
     @property
     def langfuse_configured(self) -> bool:

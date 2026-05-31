@@ -43,7 +43,6 @@ async def main() -> None:
                 guest_role="Founder and CEO",
                 guest_company="Qantm AI",
                 recording_date="2024-11-25",
-                theme="Preventing Global Tech Homogenization",
                 status="draft",
             )
             session.add(episode)
@@ -54,7 +53,6 @@ async def main() -> None:
                     icp="B2B technology leaders, founders, and enterprise teams exploring responsible AI.",
                     target_audience="Executives and senior product/data leaders.",
                     audience_pain_points="AI risk, governance, cultural bias, global representation, cost, and ROI.",
-                    tkxel_services="AI strategy, data platforms, product engineering, cloud modernization.",
                     hot_topic="Technological colonialism and AI homogenization",
                     business_objectives="Grow BetterTech's audience and create credible AI strategy conversations.",
                     episode_plan="Find strong shorts and deeper highlights from Dr. Seth's AI governance discussion.",

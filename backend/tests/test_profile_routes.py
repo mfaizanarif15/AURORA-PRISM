@@ -16,7 +16,6 @@ async def test_update_current_user_changes_profile_and_password() -> None:
             id="user-1",
             username="operator",
             display_name="Operator One",
-            role="Content Operations",
             password_hash=hash_password("old-password"),
         )
         session.add(user)
@@ -30,7 +29,6 @@ async def test_update_current_user_changes_profile_and_password() -> None:
                     id=user.id,
                     username=user.username,
                     display_name=user.display_name,
-                    role=user.role,
                 )
             )
         )

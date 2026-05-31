@@ -1,12 +1,10 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AuthSession, EpisodeEvent } from "./types";
+import type { AnalysisEvent, AuthSession } from "./types";
 
 class MockEventSource {
   static instances: MockEventSource[] = [];
-
-  onopen: (() => void) | null = null;
   onerror: (() => void) | null = null;
   private listeners = new Map<string, Array<(event: MessageEvent<string>) => void>>();
 
@@ -22,9 +20,9 @@ class MockEventSource {
 
   close = vi.fn();
 
-  emitEpisode(event: EpisodeEvent) {
-    const payload = new MessageEvent("episode", { data: JSON.stringify(event) });
-    this.listeners.get("episode")?.forEach((listener) => listener(payload));
+  emitAnalysis(event: AnalysisEvent) {
+    const payload = new MessageEvent("analysis", { data: JSON.stringify(event) });
+    this.listeners.get("analysis")?.forEach((listener) => listener(payload));
   }
 }
 
@@ -59,81 +57,49 @@ describe("App", () => {
       })
     );
     render(<App />);
-    expect(await screen.findByText("PRISM Board")).toBeInTheDocument();
+    expect(await screen.findByText("Outputs")).toBeInTheDocument();
+    expect(screen.getByText("Output Sections")).toBeInTheDocument();
+    expect(screen.getByText("30-60s")).toBeInTheDocument();
+    expect(screen.getByText("3-6m")).toBeInTheDocument();
+    expect(screen.getByLabelText("TikTok enabled")).not.toBeChecked();
+    expect(screen.getByLabelText("Reels enabled")).not.toBeChecked();
+    expect(screen.getByLabelText("TikTok min seconds")).toHaveValue(30);
+    expect(screen.getByLabelText("TikTok max seconds")).toHaveValue(60);
+    expect(screen.getByLabelText("TikTok count")).toHaveValue(3);
+    fireEvent.change(screen.getByLabelText("TikTok min seconds"), { target: { value: "" } });
+    expect(screen.getByLabelText("TikTok min seconds")).toHaveValue(null);
   });
 
-  it("removes completed SSE events from the operation progress UI", async () => {
+  it("shows analysis SSE progress only after Run Analysis is clicked", async () => {
     storeTestSession();
     vi.stubGlobal("EventSource", MockEventSource);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.includes("/auth/me")) {
-          return {
-            ok: true,
-            json: async () => testSession.user
-          };
-        }
-        if (url.includes("/clips")) {
-          return {
-            ok: true,
-            json: async () => []
-          };
-        }
-
-        return {
-          ok: true,
-          json: async () => [
-            {
-              id: "episode-1",
-              title: "SSE Test Episode",
-              guest_name: "Demo Guest",
-              status: "draft",
-              clip_count: 0,
-              asset_count: 0,
-              media_asset_count: 0,
-              transcript_segment_count: 0
-            }
-          ]
-        };
-      })
-    );
+    vi.stubGlobal("fetch", vi.fn(fetchForAnalyzableEpisode));
 
     render(<App />);
 
+    expect(screen.queryByText("Running section specialists")).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByLabelText("TikTok enabled"));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Analysis" }));
+
+    expect(await screen.findByText("Starting analysis")).toBeInTheDocument();
     await waitFor(() => expect(MockEventSource.instances).toHaveLength(1));
+    expect(MockEventSource.instances[0].url).toContain("/episodes/episode-1/analysis-events");
 
     act(() => {
-      MockEventSource.instances[0].emitEpisode({
-        id: 1,
-        episode_id: "episode-1",
-        event_type: "analysis.requested",
-        message: "Analysis request received",
-        level: "info",
-        progress: 5,
-        data: {},
-        created_at: "2026-05-31T00:00:00.000Z"
-      });
-    });
-
-    expect(await screen.findByText("Analysis request received")).toBeInTheDocument();
-
-    act(() => {
-      MockEventSource.instances[0].emitEpisode({
+      MockEventSource.instances[0].emitAnalysis({
         id: 2,
         episode_id: "episode-1",
-        event_type: "analysis.completed",
-        message: "Analysis completed with 3 clips",
-        level: "success",
-        progress: 100,
-        data: { analysis_run_id: "analysis-1", generated_clip_count: 3 },
-        created_at: "2026-05-31T00:00:01.000Z"
+        event_type: "analysis.section_specialists",
+        message: "Running section specialists",
+        level: "info",
+        progress: 55,
+        data: {},
+        created_at: new Date().toISOString()
       });
     });
 
-    expect(screen.queryByText("Analysis completed with 3 clips")).not.toBeInTheDocument();
-    expect(screen.queryByText("Analysis request received")).not.toBeInTheDocument();
+    expect(await screen.findByText("Running section specialists")).toBeInTheDocument();
+    expect(screen.getByText("55%")).toBeInTheDocument();
   });
 });
 
@@ -144,11 +110,54 @@ const testSession: AuthSession = {
   user: {
     id: "user-1",
     username: "operator",
-    display_name: "Operator One",
-    role: "Reviewer"
+    display_name: "Operator One"
   }
 };
 
 function storeTestSession() {
   window.localStorage.setItem("aurora-prism:auth-session", JSON.stringify(testSession));
+}
+
+async function fetchForAnalyzableEpisode(input: RequestInfo | URL, init?: RequestInit) {
+  const url = String(input);
+  if (url.includes("/auth/me")) {
+    return jsonResponse(testSession.user);
+  }
+  if (url.includes("/episodes/episode-1/analyze") && init?.method === "POST") {
+    return jsonResponse({
+      id: "analysis-1",
+      episode_id: "episode-1",
+      status: "completed",
+      mode: "hybrid",
+      summary: "Done",
+      generated_clip_count: 0
+    });
+  }
+  if (url.includes("/clips")) {
+    return jsonResponse([]);
+  }
+  if (url.includes("/episodes")) {
+    return jsonResponse([
+      {
+        id: "episode-1",
+        title: "Analyzable Episode",
+        guest_name: "Demo Guest",
+        status: "draft",
+        clip_count: 0,
+        asset_count: 0,
+        media_asset_count: 0,
+        transcript_segment_count: 12
+      }
+    ]);
+  }
+  return jsonResponse({});
+}
+
+function jsonResponse(value: unknown) {
+  return {
+    ok: true,
+    json: async () => value,
+    text: async () => JSON.stringify(value),
+    statusText: "OK"
+  } as Response;
 }

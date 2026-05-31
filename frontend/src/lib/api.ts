@@ -142,9 +142,10 @@ export const api = {
     request(`/episodes/${episodeId}/transcript`, { method: "POST", body: form }),
   analyze: (episodeId: string, payload: AnalysisPayload) =>
     request<AnalysisRun>(`/episodes/${episodeId}/analyze`, { method: "POST", body: JSON.stringify(payload) }),
-  clips: (episodeId: string, filters: { clip_type?: string; status?: string }) => {
+  clips: (episodeId: string, filters: { clip_type?: string; target_platform?: string; status?: string }) => {
     const params = new URLSearchParams();
     if (filters.clip_type) params.set("clip_type", filters.clip_type);
+    if (filters.target_platform) params.set("target_platform", filters.target_platform);
     if (filters.status) params.set("status", filters.status);
     const suffix = params.toString() ? `?${params}` : "";
     return request<Clip[]>(`/episodes/${episodeId}/clips${suffix}`);
@@ -154,6 +155,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ status, comments, user_name: userName })
     }),
+  deleteClip: (clipId: string) =>
+    request<{ status: string; clip_id: string }>(`/clips/${clipId}`, { method: "DELETE" }),
   renderClip: (clipId: string, render_types: string[]) =>
     request<RenderedClip[]>(`/clips/${clipId}/render`, {
       method: "POST",
@@ -166,5 +169,10 @@ export const api = {
     ),
   downloadExportUrl: (exportId: string) => `${API_BASE}${withAuthQuery(`/exports/${exportId}/download`)}`,
   downloadRenderUrl: (renderId: string) => `${API_BASE}${withAuthQuery(`/renders/${renderId}/download`)}`,
-  episodeEventsUrl: (episodeId: string) => `${API_BASE}${withAuthQuery(`/episodes/${episodeId}/events`)}`
+  analysisEventsUrl: (episodeId: string, since?: string) => {
+    const path = since
+      ? `/episodes/${episodeId}/analysis-events?since=${encodeURIComponent(since)}`
+      : `/episodes/${episodeId}/analysis-events`;
+    return `${API_BASE}${withAuthQuery(path)}`;
+  }
 };

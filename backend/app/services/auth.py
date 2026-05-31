@@ -23,7 +23,6 @@ class AuthUser:
     id: str
     username: str
     display_name: str
-    role: str
 
 
 PASSWORD_HASH_ITERATIONS = 210_000
@@ -43,7 +42,6 @@ def configured_user(settings: Settings) -> AuthUser:
         id="configured-admin",
         username=settings.auth_username,
         display_name=settings.auth_display_name,
-        role=settings.auth_role,
     )
 
 
@@ -90,7 +88,6 @@ def issue_access_token(user: AuthUser, settings: Settings) -> tuple[str, int]:
         "sub": user.id,
         "username": user.username,
         "display_name": user.display_name,
-        "role": user.role,
         "iat": issued_at,
         "exp": expires_at,
     }
@@ -159,7 +156,6 @@ def _verified_token_payload(token: str, settings: Settings) -> tuple[AuthUser, i
             id=user_id,
             username=username,
             display_name=str(payload.get("display_name") or settings.auth_display_name),
-            role=str(payload.get("role") or settings.auth_role),
         ),
         expires_at,
     )

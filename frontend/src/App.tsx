@@ -1,7 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
-  Bot,
   CheckCircle2,
   Clock3,
   Download,
@@ -17,7 +16,6 @@ import {
   PanelLeftOpen,
   Play,
   Radio,
-  RefreshCw,
   Save,
   Scissors,
   Settings,
@@ -31,52 +29,114 @@ import {
 } from "lucide-react";
 import aidxLogo from "./assets/aidx-logo.png";
 import { ApiError, api } from "./lib/api";
-import type { AnalysisPayload, AnalysisRun, AuthSession, Clip, Episode, EpisodeEvent, RenderedClip } from "./types";
+import type {
+  AnalysisEvent,
+  AnalysisPayload,
+  AnalysisSectionKey,
+  AuthSession,
+  Clip,
+  Episode,
+  RenderedClip
+} from "./types";
 
-const EVENT_HISTORY_LIMIT = 30;
 const AUTH_STORAGE_KEY = "aurora-prism:auth-session";
 const MIN_SIGNUP_PASSWORD_LENGTH = 8;
 const APP_PATH = "/app";
 const LOGIN_PATH = "/auth/login";
 const SIGNUP_PATH = "/auth/signup";
 
-const platforms = [
-  ["youtube_shorts", "YouTube Shorts"],
-  ["tiktok", "TikTok"],
-  ["instagram_reels", "Instagram/Reels"],
-  ["linkedin", "LinkedIn"]
+const outputSections: Array<{
+  key: AnalysisSectionKey;
+  label: string;
+  targetPlatform: string;
+  defaultMinSeconds: number;
+  defaultMaxSeconds: number;
+}> = [
+  { key: "tiktok", label: "TikTok", targetPlatform: "tiktok", defaultMinSeconds: 30, defaultMaxSeconds: 60 },
+  {
+    key: "instagram_reels",
+    label: "Reels",
+    targetPlatform: "instagram_reels",
+    defaultMinSeconds: 30,
+    defaultMaxSeconds: 75
+  },
+  {
+    key: "youtube_shorts",
+    label: "YouTube Shorts",
+    targetPlatform: "youtube_shorts",
+    defaultMinSeconds: 30,
+    defaultMaxSeconds: 90
+  },
+  { key: "linkedin", label: "LinkedIn", targetPlatform: "linkedin", defaultMinSeconds: 45, defaultMaxSeconds: 120 },
+  { key: "highlights", label: "Highlights", targetPlatform: "generic", defaultMinSeconds: 180, defaultMaxSeconds: 360 }
 ];
 
 const renderOptions = [
-  ["original", "Original"],
-  ["vertical", "Vertical"],
-  ["audio", "Audio"],
-  ["waveform", "Waveform"]
+  ["video", "Video"],
+  ["audio", "Audio"]
 ];
 
-const modeLabels: Record<AnalysisPayload["mode"], string> = {
-  hybrid: "Hybrid LLM",
-  openai: "LLM only",
-  mock: "Mock heuristic"
-};
+const DEFAULT_AI_PROVIDER: AnalysisPayload["ai_provider"] = "azure_openai";
+const DEFAULT_ANALYSIS_MODE: AnalysisPayload["mode"] = "hybrid";
+const DOCUMENT_ACCEPT = ".pdf,.docx,.txt,.md,.csv,.vtt,.srt";
+const TRANSCRIPT_ACCEPT = ".txt,.md,.vtt,.srt,.csv,.pdf,.docx,.mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm,audio/*,video/mp4,video/webm";
+const DEFAULT_SECTION_COUNT = 3;
 
 const statusActionLabels: Record<string, string> = {
-  approved: "Approve clip",
-  needs_revision: "Send to revision",
-  rejected: "Reject clip"
+  approved: "Approve output",
+  rejected: "Reject output"
 };
 
+function renderTypeLabel(renderType: string) {
+  return renderType === "audio" ? "Audio" : "Video";
+}
+
+function showRenderedClip(rendered: RenderedClip) {
+  if (rendered.status !== "failed") return true;
+  const error = rendered.error?.toLowerCase() ?? "";
+  return !(error.includes("no such file or directory") && error.includes("ffmpeg"));
+}
+
 const emptyContext = {
-  icp: "B2B technology leaders, founders, and enterprise product teams",
-  target_audience: "Executives evaluating AI, software modernization, and data strategy",
-  audience_pain_points: "AI uncertainty, implementation cost, unclear ROI, risk, and speed to market",
-  tkxel_services: "AI strategy, product engineering, data platforms, cloud modernization",
-  hot_topic: "AI strategy and business impact",
-  business_objectives: "Increase BetterTech audience quality and create qualified conversations for TKXEL",
+  icp: "",
+  target_audience: "",
+  audience_pain_points: "",
+  hot_topic: "",
+  business_objectives: "",
   episode_plan: "",
   preferred_platforms: ["youtube_shorts", "tiktok", "instagram_reels", "linkedin"],
-  editor_notes: "Keep claims credible, executive-friendly, and specific."
+  editor_notes: ""
 };
+
+function defaultAnalysisSections(): AnalysisPayload["sections"] {
+  return {
+    tiktok: defaultAnalysisSection("tiktok", false),
+    instagram_reels: defaultAnalysisSection("instagram_reels", false),
+    youtube_shorts: defaultAnalysisSection("youtube_shorts", false),
+    linkedin: defaultAnalysisSection("linkedin", false),
+    highlights: defaultAnalysisSection("highlights", false)
+  };
+}
+
+function defaultAnalysisSection(sectionKey: AnalysisSectionKey, enabled: boolean) {
+  const section = outputSections.find((item) => item.key === sectionKey)!;
+  return {
+    enabled,
+    target_count: DEFAULT_SECTION_COUNT,
+    duration_min_seconds: section.defaultMinSeconds,
+    duration_max_seconds: section.defaultMaxSeconds
+  };
+}
+
+function formatDurationRange(minSeconds: number | null, maxSeconds: number | null) {
+  if (minSeconds === null || maxSeconds === null) {
+    return "Default";
+  }
+  if (minSeconds >= 60 && minSeconds % 60 === 0 && maxSeconds % 60 === 0) {
+    return `${minSeconds / 60}-${maxSeconds / 60}m`;
+  }
+  return `${minSeconds}-${maxSeconds}s`;
+}
 
 export default function App() {
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => readStoredAuthSession());
@@ -110,7 +170,6 @@ export default function App() {
     guest_name: "",
     guest_role: "",
     guest_company: "",
-    theme: "",
     recording_date: ""
   });
   const [loginError, setLoginError] = useState("");
@@ -120,35 +179,34 @@ export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [selectedClipId, setSelectedClipId] = useState("");
   const [busy, setBusy] = useState("");
-  const [message, setMessage] = useState("");
-  const [messageTone, setMessageTone] = useState<"info" | "success" | "error">("info");
-  const [episodeEvents, setEpisodeEvents] = useState<EpisodeEvent[]>([]);
+  const [analysisEvent, setAnalysisEvent] = useState<AnalysisEvent | null>(null);
+  const analysisEventSourceRef = useRef<EventSource | null>(null);
+  const analysisEventStartedAtRef = useRef("");
   const [reviewerName, setReviewerName] = useState("AURORA Demo");
   const [createForm, setCreateForm] = useState({
     title: "",
     guest_name: "",
     guest_role: "",
     guest_company: "",
-    theme: "",
     recording_date: ""
   });
   const [contextForm, setContextForm] = useState(emptyContext);
   const [transcriptText, setTranscriptText] = useState("");
   const [transcriptFile, setTranscriptFile] = useState<File | null>(null);
-  const [assetFile, setAssetFile] = useState<File | null>(null);
-  const [assetType, setAssetType] = useState("video");
-  const [renderTypes, setRenderTypes] = useState<string[]>(["original", "vertical"]);
-  const [clipTypeFilter, setClipTypeFilter] = useState("");
+  const [audioAssetFile, setAudioAssetFile] = useState<File | null>(null);
+  const [videoAssetFile, setVideoAssetFile] = useState<File | null>(null);
+  const [documentFile, setDocumentFile] = useState<File | null>(null);
+  const [renderTypes, setRenderTypes] = useState<string[]>([]);
+  const [renderError, setRenderError] = useState("");
+  const [purposeFilter, setPurposeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [analysis, setAnalysis] = useState<AnalysisPayload>({
-    ai_provider: "azure_openai",
-    clip_types: ["short", "highlight"],
+    ai_provider: DEFAULT_AI_PROVIDER,
     duration_min_seconds: null,
     duration_max_seconds: null,
-    target_clip_count: 10,
-    platforms: ["youtube_shorts", "tiktok", "instagram_reels", "linkedin"],
     custom_instructions: "",
-    mode: "hybrid"
+    mode: DEFAULT_ANALYSIS_MODE,
+    sections: defaultAnalysisSections()
   });
 
   useEffect(() => {
@@ -205,31 +263,16 @@ export default function App() {
     if (authSession && selectedEpisodeId) {
       loadClips();
     }
-  }, [authSession?.access_token, selectedEpisodeId, clipTypeFilter, statusFilter]);
+  }, [authSession?.access_token, selectedEpisodeId, purposeFilter, statusFilter]);
 
   useEffect(() => {
-    if (!authSession || !selectedEpisodeId) {
-      setEpisodeEvents([]);
-      return;
-    }
+    return () => closeAnalysisEventStream();
+  }, []);
 
-    setEpisodeEvents(readStoredEpisodeEvents(selectedEpisodeId));
-    const source = new EventSource(api.episodeEventsUrl(selectedEpisodeId));
-    source.addEventListener("episode", (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as EpisodeEvent;
-        setEpisodeEvents((current) => {
-          const next = mergeEpisodeEvent(current, parsed);
-          storeEpisodeEvents(selectedEpisodeId, next);
-          return next;
-        });
-      } catch {
-        // Ignore malformed SSE payloads without interrupting the workspace.
-      }
-    });
-
-    return () => source.close();
-  }, [authSession?.access_token, selectedEpisodeId]);
+  useEffect(() => {
+    closeAnalysisEventStream();
+    setAnalysisEvent(null);
+  }, [selectedEpisodeId]);
 
   const selectedEpisode = useMemo(
     () => episodes.find((episode) => episode.id === selectedEpisodeId),
@@ -242,7 +285,6 @@ export default function App() {
       guest_name: selectedEpisode.guest_name ?? "",
       guest_role: selectedEpisode.guest_role ?? "",
       guest_company: selectedEpisode.guest_company ?? "",
-      theme: selectedEpisode.theme ?? "",
       recording_date: selectedEpisode.recording_date ?? ""
     });
     setEpisodeDetailsMessage("");
@@ -251,15 +293,22 @@ export default function App() {
     () => clips.find((clip) => clip.id === selectedClipId) ?? clips[0],
     [clips, selectedClipId]
   );
+  useEffect(() => {
+    setRenderError("");
+  }, [selectedClip?.id]);
   const approvedCount = clips.filter((clip) => clip.status === "approved").length;
-  const recommendedCount = clips.filter((clip) => clip.status === "recommended").length;
-  const latestEvent = episodeEvents[0] ?? null;
-  const currentEvent = latestEvent && !isCompletedEpisodeEvent(latestEvent) ? latestEvent : null;
-  const currentEventProgress = currentEvent ? eventProgress(currentEvent) : null;
+  const groupedOutputs = outputSections
+    .map((section) => ({
+      ...section,
+      items: clips.filter((clip) => clip.target_platform === section.targetPlatform)
+    }))
+    .filter((section) => section.items.length > 0);
   const transcriptReady = Boolean(selectedEpisode?.transcript_segment_count);
   const hasMediaAsset = Boolean(selectedEpisode?.media_asset_count);
-  const canAnalyze = Boolean(selectedEpisodeId && transcriptReady && !busy);
+  const hasSelectedOutputSection = Object.values(analysis.sections).some((section) => section.enabled);
+  const canAnalyze = Boolean(selectedEpisodeId && transcriptReady && hasSelectedOutputSection && !busy);
   const canUploadTranscript = Boolean(selectedEpisodeId && !busy && (transcriptFile || transcriptText.trim()));
+  const visibleAnalysisEvent = analysisEvent?.episode_id === selectedEpisodeId ? analysisEvent : null;
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -332,7 +381,6 @@ export default function App() {
       guest_name: selectedEpisode.guest_name ?? "",
       guest_role: selectedEpisode.guest_role ?? "",
       guest_company: selectedEpisode.guest_company ?? "",
-      theme: selectedEpisode.theme ?? "",
       recording_date: selectedEpisode.recording_date ?? ""
     });
     setEpisodeDetailsTone("success");
@@ -422,27 +470,84 @@ export default function App() {
     setSelectedEpisodeId("");
     setClips([]);
     setSelectedClipId("");
-    setEpisodeEvents([]);
+    closeAnalysisEventStream();
+    setAnalysisEvent(null);
     setBusy("");
-    setMessage("");
   }
 
-  async function run<T>(label: string, action: () => Promise<T>, done?: (result: T) => void | Promise<void>) {
+  async function run<T>(
+    label: string,
+    action: () => Promise<T>,
+    done?: (result: T) => void | Promise<void>
+  ) {
     setBusy(label);
-    setMessage(`${label} running`);
-    setMessageTone("info");
     try {
       const result = await action();
       await done?.(result);
-      setMessage(`${label} complete`);
-      setMessageTone("success");
     } catch (error) {
       if (handleAuthFailure(error)) return;
-      setMessage(error instanceof Error ? error.message : "Something went wrong");
-      setMessageTone("error");
+      console.error(error instanceof Error ? error.message : "Something went wrong");
     } finally {
       setBusy("");
     }
+  }
+
+  function closeAnalysisEventStream() {
+    analysisEventSourceRef.current?.close();
+    analysisEventSourceRef.current = null;
+  }
+
+  function startAnalysisEventStream(episodeId: string) {
+    const startedAt = new Date().toISOString();
+    analysisEventStartedAtRef.current = startedAt;
+    closeAnalysisEventStream();
+    setAnalysisEvent({
+      id: Date.now(),
+      episode_id: episodeId,
+      event_type: "analysis.connecting",
+      message: "Starting analysis",
+      level: "info",
+      progress: 0,
+      data: {},
+      created_at: startedAt
+    });
+
+    const source = new EventSource(api.analysisEventsUrl(episodeId, startedAt));
+    analysisEventSourceRef.current = source;
+    source.addEventListener("analysis", (event) => {
+      try {
+        const parsed = JSON.parse(event.data) as AnalysisEvent;
+        if (
+          parsed.episode_id !== episodeId ||
+          isBeforeIsoTime(parsed.created_at, analysisEventStartedAtRef.current)
+        ) {
+          return;
+        }
+        setAnalysisEvent(parsed);
+        if (isTerminalAnalysisEvent(parsed)) {
+          source.close();
+          if (analysisEventSourceRef.current === source) {
+            analysisEventSourceRef.current = null;
+          }
+        }
+      } catch {
+        // Ignore malformed stream payloads without interrupting analysis.
+      }
+    });
+    source.onerror = () => {
+      if (analysisEventSourceRef.current !== source) return;
+      source.close();
+      analysisEventSourceRef.current = null;
+      setAnalysisEvent((current) => {
+        if (!current || isTerminalAnalysisEvent(current)) return current;
+        return {
+          ...current,
+          event_type: "analysis.stream_error",
+          message: "Analysis progress stream disconnected",
+          level: "error"
+        };
+      });
+    };
   }
 
   async function loadEpisodes() {
@@ -454,8 +559,7 @@ export default function App() {
       );
     } catch (error) {
       if (handleAuthFailure(error)) return;
-      setMessage(error instanceof Error ? error.message : "Unable to load episodes");
-      setMessageTone("error");
+      console.error(error instanceof Error ? error.message : "Unable to load episodes");
     }
   }
 
@@ -467,13 +571,11 @@ export default function App() {
 
   async function deleteEpisode(episode: Episode) {
     const confirmed = window.confirm(
-      `Delete "${episode.title}" from history? This removes its clips, transcripts, assets, and exports.`
+      `Delete "${episode.title}" from history? This removes its outputs, transcripts, assets, and exports.`
     );
     if (!confirmed) return;
 
     setBusy("Delete episode");
-    setMessage("Deleting episode");
-    setMessageTone("info");
     try {
       await api.deleteEpisode(episode.id);
       setEpisodes((current) => {
@@ -483,17 +585,12 @@ export default function App() {
           setSelectedEpisodeId(nextSelectedEpisodeId);
           setClips([]);
           setSelectedClipId("");
-          setEpisodeEvents([]);
         }
         return next;
       });
-      removeStoredEpisodeEvents(episode.id);
-      setMessage("Episode deleted");
-      setMessageTone("success");
     } catch (error) {
       if (handleAuthFailure(error)) return;
-      setMessage(error instanceof Error ? error.message : "Unable to delete episode");
-      setMessageTone("error");
+      console.error(error instanceof Error ? error.message : "Unable to delete episode");
     } finally {
       setBusy("");
     }
@@ -502,13 +599,12 @@ export default function App() {
   async function loadClips() {
     if (!selectedEpisodeId) return;
     try {
-      const data = await api.clips(selectedEpisodeId, { clip_type: clipTypeFilter, status: statusFilter });
+      const data = await api.clips(selectedEpisodeId, { target_platform: purposeFilter, status: statusFilter });
       setClips(data);
       setSelectedClipId((current) => (data.some((clip) => clip.id === current) ? current : data[0]?.id ?? ""));
     } catch (error) {
       if (handleAuthFailure(error)) return;
-      setMessage(error instanceof Error ? error.message : "Unable to load clips");
-      setMessageTone("error");
+      console.error(error instanceof Error ? error.message : "Unable to load outputs");
     }
   }
 
@@ -530,30 +626,63 @@ export default function App() {
     setSelectedClipId(clip.id);
   }
 
-  function updateAnalysisClipType(type: "short" | "highlight", enabled: boolean) {
+  function updateSectionEnabled(section: AnalysisSectionKey, enabled: boolean) {
     setAnalysis((current) => {
-      const clipTypes = enabled
-        ? Array.from(new Set([...current.clip_types, type]))
-        : current.clip_types.filter((item) => item !== type);
-      return { ...current, clip_types: clipTypes.length ? clipTypes : [type] };
+      const nextSections = {
+        ...current.sections,
+        [section]: { ...current.sections[section], enabled }
+      };
+      return { ...current, sections: nextSections };
     });
   }
 
-  function updatePlatform(platform: string, enabled: boolean) {
+  function updateSectionCount(section: AnalysisSectionKey, value: number) {
     setAnalysis((current) => {
-      const selected = enabled
-        ? Array.from(new Set([...current.platforms, platform]))
-        : current.platforms.filter((item) => item !== platform);
-      return { ...current, platforms: selected.length ? selected : [platform] };
+      const targetCount = Math.min(10, Math.max(1, Number.isFinite(value) ? value : DEFAULT_SECTION_COUNT));
+      return {
+        ...current,
+        sections: {
+          ...current.sections,
+          [section]: { ...current.sections[section], target_count: targetCount }
+        }
+      };
+    });
+  }
+
+  function updateSectionDuration(
+    section: AnalysisSectionKey,
+    field: "duration_min_seconds" | "duration_max_seconds",
+    value: number | null
+  ) {
+    setAnalysis((current) => {
+      const nextValue = value === null || !Number.isFinite(value) ? null : Math.min(1800, Math.max(1, value));
+      const nextSection = { ...current.sections[section], [field]: nextValue };
+      if (
+        nextSection.duration_min_seconds !== null &&
+        nextSection.duration_max_seconds !== null &&
+        nextSection.duration_min_seconds > nextSection.duration_max_seconds
+      ) {
+        if (field === "duration_min_seconds") {
+          nextSection.duration_max_seconds = nextSection.duration_min_seconds;
+        } else {
+          nextSection.duration_min_seconds = nextSection.duration_max_seconds;
+        }
+      }
+      return {
+        ...current,
+        sections: {
+          ...current.sections,
+          [section]: nextSection
+        }
+      };
     });
   }
 
   function updateRenderType(renderType: string, enabled: boolean) {
     setRenderTypes((current) => {
-      const selected = enabled
+      return enabled
         ? Array.from(new Set([...current, renderType]))
         : current.filter((item) => item !== renderType);
-      return selected.length ? selected : [renderType];
     });
   }
 
@@ -567,7 +696,6 @@ export default function App() {
         guest_name: "",
         guest_role: "",
         guest_company: "",
-        theme: "",
         recording_date: ""
       });
     });
@@ -580,7 +708,6 @@ export default function App() {
       guest_name: createForm.guest_name.trim() || null,
       guest_role: createForm.guest_role.trim() || null,
       guest_company: createForm.guest_company.trim() || null,
-      theme: createForm.theme.trim() || null,
       recording_date: createForm.recording_date.trim() || null
     };
   }
@@ -603,7 +730,6 @@ export default function App() {
         guest_name: episodeDetailsForm.guest_name.trim() || null,
         guest_role: episodeDetailsForm.guest_role.trim() || null,
         guest_company: episodeDetailsForm.guest_company.trim() || null,
-        theme: episodeDetailsForm.theme.trim() || null,
         recording_date: episodeDetailsForm.recording_date.trim() || null
       });
       mergeEpisode(updated);
@@ -623,7 +749,7 @@ export default function App() {
     setEpisodeDetailsBusy(true);
     setEpisodeDetailsMessage("");
     try {
-      const updated = await api.autoTitleEpisode(selectedEpisodeId, analysis.ai_provider);
+      const updated = await api.autoTitleEpisode(selectedEpisodeId, DEFAULT_AI_PROVIDER);
       mergeEpisode(updated);
       setEpisodeDetailsForm((current) => ({ ...current, title: updated.title }));
       setEpisodeDetailsTone("success");
@@ -657,70 +783,75 @@ export default function App() {
     });
   }
 
-  function uploadAsset(event: FormEvent) {
+  function uploadDocument(event: FormEvent) {
     event.preventDefault();
-    if (!selectedEpisodeId || !assetFile) return;
+    if (!selectedEpisodeId || !documentFile) return;
     const form = new FormData();
-    form.append("file", assetFile);
-    form.append("asset_type", assetType);
-    form.append("is_primary", ["video", "audio"].includes(assetType) ? "true" : "false");
-    run("Asset", () => api.uploadAsset(selectedEpisodeId, form), async () => {
-      setAssetFile(null);
+    form.append("file", documentFile);
+    form.append("asset_type", "guest_document");
+    form.append("is_primary", "false");
+    run("Document", () => api.uploadAsset(selectedEpisodeId, form), async () => {
+      setDocumentFile(null);
       await loadEpisodes();
     });
   }
 
-  function analyzeEpisode() {
-    if (!selectedEpisodeId || !transcriptReady) return;
-    const episodeId = selectedEpisodeId;
-    const shouldAutoTitle = isDefaultEpisodeTitle(selectedEpisode?.title);
-    run("Analysis", () => api.analyze(episodeId, analysis), async (analysisRun) => {
-      rememberCompletedAnalysisEvent(episodeId, analysisRun);
-      await Promise.all([loadEpisodes(), loadClips()]);
-      if (shouldAutoTitle) {
-        try {
-          const updated = await api.autoTitleEpisode(episodeId, analysis.ai_provider);
-          mergeEpisode(updated);
-        } catch (error) {
-          if (handleAuthFailure(error)) return;
-        }
+  function uploadAsset(event: FormEvent, assetType: "audio" | "video") {
+    event.preventDefault();
+    const file = assetType === "audio" ? audioAssetFile : videoAssetFile;
+    if (!selectedEpisodeId || !file) return;
+    const form = new FormData();
+    form.append("file", file);
+    form.append("asset_type", assetType);
+    form.append("is_primary", "true");
+    run(assetType === "audio" ? "Audio" : "Video", () => api.uploadAsset(selectedEpisodeId, form), async () => {
+      if (assetType === "audio") {
+        setAudioAssetFile(null);
+      } else {
+        setVideoAssetFile(null);
       }
+      await loadEpisodes();
     });
   }
 
-  function rememberCompletedAnalysisEvent(episodeId: string, analysisRun: AnalysisRun) {
-    const completedEvent: EpisodeEvent = {
-      id: Date.now(),
-      episode_id: episodeId,
-      event_type: "analysis.completed",
-      message: `Analysis completed with ${analysisRun.generated_clip_count} clips`,
-      level: "success",
-      progress: 100,
-      data: {
-        analysis_run_id: analysisRun.id,
-        generated_clip_count: analysisRun.generated_clip_count,
-        source: "api_completion_fallback"
-      },
-      created_at: new Date().toISOString()
-    };
+  async function analyzeEpisode() {
+    if (!selectedEpisodeId || !transcriptReady || !hasSelectedOutputSection) return;
+    const episodeId = selectedEpisodeId;
+    startAnalysisEventStream(episodeId);
+    setBusy("Analysis");
+    try {
+      await api.analyze(episodeId, analysisPayload());
+      await Promise.all([loadEpisodes(), loadClips()]);
+    } catch (error) {
+      if (handleAuthFailure(error)) return;
+      closeAnalysisEventStream();
+      setAnalysisEvent({
+        id: Date.now(),
+        episode_id: episodeId,
+        event_type: "analysis.failed",
+        message: error instanceof Error ? error.message : "Analysis failed",
+        level: "error",
+        progress: 100,
+        data: {},
+        created_at: new Date().toISOString()
+      });
+    } finally {
+      setBusy("");
+    }
+  }
 
-    setEpisodeEvents((current) => {
-      const alreadyStored = current.some(
-        (event) =>
-          event.event_type === "analysis.completed" &&
-          event.data.analysis_run_id === analysisRun.id
-      );
-      if (alreadyStored) return current;
-      const next = mergeEpisodeEvent(current, completedEvent);
-      storeEpisodeEvents(episodeId, next);
-      return next;
-    });
+  function analysisPayload(): AnalysisPayload {
+    return {
+      ...analysis,
+      ai_provider: DEFAULT_AI_PROVIDER,
+      mode: DEFAULT_ANALYSIS_MODE
+    };
   }
 
   function setClipStatus(clip: Clip, status: string) {
     const userName = reviewerName.trim() || "AURORA Demo";
     run(
-      statusActionLabels[status] ?? "Update clip",
+      statusActionLabels[status] ?? "Update output",
       () => api.updateClipStatus(clip.id, status, "", userName),
       async (updatedClip) => {
         mergeClip(updatedClip);
@@ -729,16 +860,42 @@ export default function App() {
     );
   }
 
-  function renderClip(clip: Clip) {
-    if (!hasMediaAsset) {
-      setMessage("Upload a video or audio asset before rendering clips.");
-      setMessageTone("error");
+  async function deleteOutput(clip: Clip) {
+    const confirmed = window.confirm(`Delete output ${clip.purpose} ${clip.rank}?`);
+    if (!confirmed) return;
+
+    setBusy("Delete output");
+    try {
+      await api.deleteClip(clip.id);
+      setClips((current) => current.filter((item) => item.id !== clip.id));
+      if (selectedClipId === clip.id) {
+        setSelectedClipId("");
+      }
+      await Promise.all([loadClips(), loadEpisodes()]);
+    } catch (error) {
+      if (handleAuthFailure(error)) return;
+      console.error(error instanceof Error ? error.message : "Unable to delete output");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function renderClip(clip: Clip) {
+    if (!hasMediaAsset || renderTypes.length === 0) {
       return;
     }
-    run("Render", () => api.renderClip(clip.id, renderTypes), async (renderedClips) => {
+    setRenderError("");
+    setBusy("Render");
+    try {
+      const renderedClips = await api.renderClip(clip.id, renderTypes);
       mergeRenderedClips(clip, renderedClips);
       await loadClips();
-    });
+    } catch (error) {
+      if (handleAuthFailure(error)) return;
+      setRenderError(error instanceof Error ? error.message : "Unable to render output");
+    } finally {
+      setBusy("");
+    }
   }
 
   function exportEpisode() {
@@ -923,7 +1080,7 @@ export default function App() {
           </div>
           <div>
             <strong>{authSession.user.display_name}</strong>
-            <small>{authSession.user.role}</small>
+            <small>@{authSession.user.username}</small>
           </div>
           <button className="ghost icon-button" onClick={openSettings} aria-label="User settings" title="User settings">
             <Settings size={16} />
@@ -956,10 +1113,6 @@ export default function App() {
                   type="button"
                 >
                   <strong>{episode.title}</strong>
-                  <span className={`status-pill status-${episode.status}`}>{episode.status}</span>
-                  <small>
-                    {episode.clip_count} clips · {episode.asset_count} assets · {episode.transcript_segment_count} segments
-                  </small>
                 </button>
                 <button
                   className="episode-delete-button"
@@ -1017,13 +1170,6 @@ export default function App() {
             >
               <FileText size={16} />
             </button>
-            <button className="ghost icon-button" onClick={() => loadEpisodes()} aria-label="Refresh episodes" title="Refresh episodes">
-              <RefreshCw size={16} />
-            </button>
-            <button onClick={analyzeEpisode} disabled={!canAnalyze}>
-              <WandSparkles size={16} />
-              Analyze with {analysis.mode === "mock" ? "rules" : "LLM"}
-            </button>
             <button className="secondary" onClick={exportEpisode} disabled={!selectedEpisodeId || Boolean(busy)}>
               <Download size={16} />
               Export
@@ -1031,55 +1177,31 @@ export default function App() {
           </div>
         </header>
 
-        {currentEvent && (
-          <div className={`operation-progress-line ${currentEvent.level}`} aria-live="polite">
-            <span className="operation-progress-label">
-              {currentEventProgress ?? 0}%
-            </span>
-            <div className="operation-progress-track" aria-label={`Progress ${currentEventProgress ?? 0}%`}>
-              <span style={{ width: `${currentEventProgress ?? 0}%` }} />
-            </div>
-            <span className="operation-progress-text">
-              {currentEvent.message}
-            </span>
-          </div>
-        )}
-
         <section className="metrics-strip">
           <div>
             <span>{clips.length}</span>
-            <small>Total clips</small>
-          </div>
-          <div>
-            <span>{recommendedCount}</span>
-            <small>Recommended</small>
+            <small>Total outputs</small>
           </div>
           <div>
             <span>{approvedCount}</span>
             <small>Approved</small>
           </div>
-          <div>
-            <span>{selectedEpisode?.transcript_segment_count ?? 0}</span>
-            <small>Segments</small>
-          </div>
         </section>
-
-        {message && <div className={`status-line ${messageTone}`}>{message}</div>}
 
         <div className="grid-layout">
           <section className="panel intake" id="intake">
             <div className="panel-title">
               <Upload size={18} />
               <h2>Intake</h2>
-              <span>{transcriptReady ? "Ready" : "Needs transcript"}</span>
             </div>
 
             <form className="stack" onSubmit={saveContext}>
               <label>
-                ICP
+                Ideal Customer Profile
                 <textarea
                   value={contextForm.icp}
                   onChange={(event) => setContextForm({ ...contextForm, icp: event.target.value })}
+                  placeholder="Describe the ideal audience for these outputs"
                 />
               </label>
               <label>
@@ -1087,13 +1209,7 @@ export default function App() {
                 <input
                   value={contextForm.hot_topic}
                   onChange={(event) => setContextForm({ ...contextForm, hot_topic: event.target.value })}
-                />
-              </label>
-              <label>
-                TKXEL services
-                <textarea
-                  value={contextForm.tkxel_services}
-                  onChange={(event) => setContextForm({ ...contextForm, tkxel_services: event.target.value })}
+                  placeholder="Main topic or angle for this episode"
                 />
               </label>
               <label>
@@ -1101,6 +1217,7 @@ export default function App() {
                 <textarea
                   value={contextForm.episode_plan}
                   onChange={(event) => setContextForm({ ...contextForm, episode_plan: event.target.value })}
+                  placeholder="Optional notes for what to find or avoid"
                 />
               </label>
               <button type="submit" disabled={!selectedEpisodeId || Boolean(busy)}>
@@ -1109,26 +1226,59 @@ export default function App() {
               </button>
             </form>
 
-            <form className="stack upload-block" onSubmit={uploadAsset}>
+            <div className="stack upload-block">
               <div className="section-kicker">
                 <Layers3 size={15} />
                 Assets
               </div>
+              <div className="asset-upload-grid">
+                <form className="asset-upload-row" onSubmit={(event) => uploadAsset(event, "audio")}>
+                  <div className="asset-upload-head">
+                    <Mic2 size={16} />
+                    <strong>Audio</strong>
+                  </div>
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    onChange={(event) => setAudioAssetFile(event.currentTarget.files?.[0] ?? null)}
+                  />
+                  <button type="submit" disabled={!audioAssetFile || !selectedEpisodeId || Boolean(busy)}>
+                    <Mic2 size={16} />
+                    Upload Audio
+                  </button>
+                </form>
+                <form className="asset-upload-row" onSubmit={(event) => uploadAsset(event, "video")}>
+                  <div className="asset-upload-head">
+                    <FileVideo size={16} />
+                    <strong>Video</strong>
+                  </div>
+                  <input
+                    type="file"
+                    accept="video/*"
+                    onChange={(event) => setVideoAssetFile(event.currentTarget.files?.[0] ?? null)}
+                  />
+                  <button type="submit" disabled={!videoAssetFile || !selectedEpisodeId || Boolean(busy)}>
+                    <FileVideo size={16} />
+                    Upload Video
+                  </button>
+                </form>
+              </div>
+            </div>
+
+            <form className="stack upload-block" onSubmit={uploadDocument}>
+              <div className="section-kicker">
+                <FileText size={15} />
+                Documents
+              </div>
               <div className="upload-row">
-                <select value={assetType} onChange={(event) => setAssetType(event.target.value)}>
-                  <option value="video">Video</option>
-                  <option value="audio">Audio</option>
-                  <option value="guest_document">Guest document</option>
-                  <option value="guest_headshot">Guest headshot</option>
-                  <option value="brand_reference">Brand reference</option>
-                </select>
                 <input
                   type="file"
-                  onChange={(event) => setAssetFile(event.currentTarget.files?.[0] ?? null)}
+                  accept={DOCUMENT_ACCEPT}
+                  onChange={(event) => setDocumentFile(event.currentTarget.files?.[0] ?? null)}
                 />
-                <button type="submit" disabled={!assetFile || !selectedEpisodeId || Boolean(busy)}>
-                  {assetType === "audio" ? <Mic2 size={16} /> : <FileVideo size={16} />}
-                  Upload
+                <button type="submit" disabled={!documentFile || !selectedEpisodeId || Boolean(busy)}>
+                  <FileText size={16} />
+                  Upload Document
                 </button>
               </div>
             </form>
@@ -1148,12 +1298,12 @@ export default function App() {
               </label>
               <input
                 type="file"
-                accept=".txt,.vtt,.srt,.csv"
+                accept={TRANSCRIPT_ACCEPT}
                 onChange={(event) => setTranscriptFile(event.currentTarget.files?.[0] ?? null)}
               />
               <button type="submit" disabled={!canUploadTranscript}>
                 <Upload size={16} />
-                Save Transcript
+                Parse Transcript
               </button>
             </form>
           </section>
@@ -1161,104 +1311,72 @@ export default function App() {
           <section className="panel controls" id="instructions">
             <div className="panel-title">
               <Scissors size={18} />
-              <h2>Clip Instructions</h2>
-              <span>{modeLabels[analysis.mode]}</span>
+              <h2>Output Sections</h2>
             </div>
-            <div className="toggle-grid">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={analysis.clip_types.includes("short")}
-                  onChange={(event) => updateAnalysisClipType("short", event.target.checked)}
-                />
-                Shorts
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={analysis.clip_types.includes("highlight")}
-                  onChange={(event) => updateAnalysisClipType("highlight", event.target.checked)}
-                />
-                3-6 min highlights
-              </label>
-            </div>
-            <label>
-              AI provider
-              <select
-                value={analysis.ai_provider}
-                onChange={(event) =>
-                  setAnalysis({ ...analysis, ai_provider: event.target.value as "azure_openai" | "openai" })
-                }
-              >
-                <option value="azure_openai">Azure OpenAI</option>
-                <option value="openai">OpenAI</option>
-              </select>
-            </label>
-            <label>
-              Analysis mode
-              <select
-                value={analysis.mode}
-                onChange={(event) =>
-                  setAnalysis({ ...analysis, mode: event.target.value as "mock" | "hybrid" | "openai" })
-                }
-              >
-                <option value="hybrid">Hybrid LLM</option>
-                <option value="openai">LLM only</option>
-                <option value="mock">Mock heuristic</option>
-              </select>
-            </label>
-            <div className="mode-summary">
-              <Bot size={18} />
-              <span>
-                {analysis.mode === "mock"
-                  ? "Uses local scoring and template metadata without provider calls."
-                  : analysis.mode === "hybrid"
-                    ? "LLM ranks shortlisted moments and falls back to local scoring if needed."
-                    : "Requires a live provider response before clips are saved."}
-              </span>
-            </div>
-            <div className="two-col">
-              <label>
-                Min seconds
-                <input
-                  type="number"
-                  value={analysis.duration_min_seconds ?? ""}
-                  onChange={(event) =>
-                    setAnalysis({ ...analysis, duration_min_seconds: event.target.value ? Number(event.target.value) : null })
-                  }
-                />
-              </label>
-              <label>
-                Max seconds
-                <input
-                  type="number"
-                  value={analysis.duration_max_seconds ?? ""}
-                  onChange={(event) =>
-                    setAnalysis({ ...analysis, duration_max_seconds: event.target.value ? Number(event.target.value) : null })
-                  }
-                />
-              </label>
-            </div>
-            <label>
-              Clip count
-              <input
-                type="number"
-                min={1}
-                max={30}
-                value={analysis.target_clip_count}
-                onChange={(event) => setAnalysis({ ...analysis, target_clip_count: Number(event.target.value) })}
-              />
-            </label>
-            <div className="platforms">
-              {platforms.map(([key, label]) => (
-                <label key={key}>
+            <div className="section-grid">
+              {outputSections.map((section) => (
+                <div key={section.key} className="section-row">
                   <input
+                    aria-label={`${section.label} enabled`}
                     type="checkbox"
-                    checked={analysis.platforms.includes(key)}
-                    onChange={(event) => updatePlatform(key, event.target.checked)}
+                    checked={analysis.sections[section.key].enabled}
+                    onChange={(event) => updateSectionEnabled(section.key, event.target.checked)}
                   />
-                  {label}
-                </label>
+                  <span className="section-copy">
+                    <strong>{section.label}</strong>
+                    <small>
+                      {formatDurationRange(
+                        analysis.sections[section.key].duration_min_seconds,
+                        analysis.sections[section.key].duration_max_seconds
+                      )}
+                    </small>
+                  </span>
+                  <span className="section-field">
+                    <span>Min sec</span>
+                    <input
+                      aria-label={`${section.label} min seconds`}
+                      min={1}
+                      max={1800}
+                      type="number"
+                      value={analysis.sections[section.key].duration_min_seconds ?? ""}
+                      onChange={(event) =>
+                        updateSectionDuration(
+                          section.key,
+                          "duration_min_seconds",
+                          event.target.value === "" ? null : Number(event.target.value)
+                        )
+                      }
+                    />
+                  </span>
+                  <span className="section-field">
+                    <span>Max sec</span>
+                    <input
+                      aria-label={`${section.label} max seconds`}
+                      min={1}
+                      max={1800}
+                      type="number"
+                      value={analysis.sections[section.key].duration_max_seconds ?? ""}
+                      onChange={(event) =>
+                        updateSectionDuration(
+                          section.key,
+                          "duration_max_seconds",
+                          event.target.value === "" ? null : Number(event.target.value)
+                        )
+                      }
+                    />
+                  </span>
+                  <span className="section-field">
+                    <span>Count</span>
+                    <input
+                      aria-label={`${section.label} count`}
+                      min={1}
+                      max={10}
+                      type="number"
+                      value={analysis.sections[section.key].target_count}
+                      onChange={(event) => updateSectionCount(section.key, Number(event.target.value))}
+                    />
+                  </span>
+                </div>
               ))}
             </div>
             <label>
@@ -1266,55 +1384,75 @@ export default function App() {
               <textarea
                 value={analysis.custom_instructions ?? ""}
                 onChange={(event) => setAnalysis({ ...analysis, custom_instructions: event.target.value })}
-                placeholder="Focus on AI governance, avoid salesy clips"
+                placeholder="Focus on AI governance, avoid salesy outputs"
               />
             </label>
-            <button onClick={analyzeEpisode} disabled={!canAnalyze}>
+            <button className="analysis-run-button" onClick={analyzeEpisode} disabled={!canAnalyze}>
               <WandSparkles size={16} />
               Run Analysis
             </button>
+            {visibleAnalysisEvent && (
+              <div className={`analysis-progress ${visibleAnalysisEvent.level}`} aria-live="polite">
+                <div className="analysis-progress-head">
+                  <strong>{analysisEventProgress(visibleAnalysisEvent)}%</strong>
+                  <span>{visibleAnalysisEvent.message}</span>
+                </div>
+                <div
+                  className="analysis-progress-track"
+                  aria-label={`Analysis progress ${analysisEventProgress(visibleAnalysisEvent)}%`}
+                >
+                  <span style={{ width: `${analysisEventProgress(visibleAnalysisEvent)}%` }} />
+                </div>
+              </div>
+            )}
           </section>
 
           <section className="panel board" id="board">
             <div className="board-head">
               <div className="panel-title">
                 <Filter size={18} />
-                <h2>PRISM Board</h2>
+                <h2>Outputs</h2>
               </div>
               <div className="filters">
-                <select value={clipTypeFilter} onChange={(event) => setClipTypeFilter(event.target.value)}>
-                  <option value="">All types</option>
-                  <option value="short">Shorts</option>
-                  <option value="highlight">Highlights</option>
+                <select value={purposeFilter} onChange={(event) => setPurposeFilter(event.target.value)}>
+                  <option value="">All sections</option>
+                  {outputSections.map((section) => (
+                    <option key={section.key} value={section.targetPlatform}>
+                      {section.label}
+                    </option>
+                  ))}
                 </select>
                 <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
                   <option value="">All statuses</option>
                   <option value="recommended">Recommended</option>
                   <option value="approved">Approved</option>
-                  <option value="needs_revision">Needs revision</option>
                   <option value="rejected">Rejected</option>
                 </select>
               </div>
             </div>
             <div className="clip-list">
-              {clips.map((clip) => (
-                <button
-                  key={clip.id}
-                  className={`clip-row ${selectedClip?.id === clip.id ? "active" : ""}`}
-                  onClick={() => setSelectedClipId(clip.id)}
-                >
-                  <span className="rank">{clip.rank}</span>
-                  <span>
-                    <strong>{clip.clip_type} · {clip.moment_type.replace("_", " ")}</strong>
-                    <small>
-                      {formatTime(clip.start_seconds)}-{formatTime(clip.end_seconds)} ·{" "}
-                      {Math.round(clip.duration_seconds)}s · {clip.status}
-                    </small>
-                  </span>
-                  <span className="score">{clip.score?.total_score ?? 0}</span>
-                </button>
+              {groupedOutputs.map((section) => (
+                <div key={section.key} className="section-output-group">
+                  <div className="section-output-title">{section.label}</div>
+                  {section.items.map((clip) => (
+                    <button
+                      key={clip.id}
+                      className={`clip-row ${selectedClip?.id === clip.id ? "active" : ""}`}
+                      onClick={() => setSelectedClipId(clip.id)}
+                    >
+                      <span className="rank">{clip.rank}</span>
+                      <span>
+                        <strong>{clip.purpose} · {clip.moment_type.replace("_", " ")}</strong>
+                        <small>
+                          {formatTime(clip.start_seconds)}-{formatTime(clip.end_seconds)} ·{" "}
+                          {Math.round(clip.duration_seconds)}s · {clip.status}
+                        </small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
               ))}
-              {!clips.length && <div className="empty">No clips yet</div>}
+              {!clips.length && <div className="empty">No outputs yet</div>}
             </div>
           </section>
 
@@ -1327,28 +1465,15 @@ export default function App() {
                       <Clock3 size={14} />
                       {selectedClip.status}
                     </span>
-                    <h2>Clip {selectedClip.rank}</h2>
+                    <h2>{selectedClip.purpose} {selectedClip.rank}</h2>
                     <p>
-                      {selectedClip.clip_type} · {selectedClip.moment_type.replace("_", " ")} ·{" "}
+                      {selectedClip.moment_type.replace("_", " ")} ·{" "}
                       {formatTime(selectedClip.start_seconds)}-{formatTime(selectedClip.end_seconds)}
                     </p>
                   </div>
-                  <div className="score-large">{selectedClip.score?.total_score ?? 0}</div>
                 </div>
                 <p className="excerpt">{selectedClip.excerpt}</p>
                 <p className="reasoning">{selectedClip.reasoning}</p>
-
-                <div className="score-grid">
-                  {selectedClip.score &&
-                    Object.entries(selectedClip.score)
-                      .filter(([key, value]) => typeof value === "number" && key !== "total_score")
-                      .map(([key, value]) => (
-                        <span key={key}>
-                          {key.replace(/_/g, " ")}
-                          <strong>{value}</strong>
-                        </span>
-                      ))}
-                </div>
 
                 <div className="metadata-tabs">
                   {selectedClip.metadata.map((item) => (
@@ -1372,7 +1497,7 @@ export default function App() {
                     Render outputs
                   </div>
                   {!hasMediaAsset && (
-                    <p className="render-hint">Upload a video or audio asset before rendering clips.</p>
+                    <p className="render-hint">Upload a video or audio asset before rendering outputs.</p>
                   )}
                   <div className="toggle-grid">
                     {renderOptions.map(([key, label]) => (
@@ -1393,33 +1518,39 @@ export default function App() {
                     <CheckCircle2 size={16} />
                     Approve
                   </button>
-                  <button className="secondary" onClick={() => setClipStatus(selectedClip, "needs_revision")} disabled={Boolean(busy)}>
-                    <RefreshCw size={16} />
-                    Revision
-                  </button>
                   <button className="danger" onClick={() => setClipStatus(selectedClip, "rejected")} disabled={Boolean(busy)}>
                     <XCircle size={16} />
                     Reject
                   </button>
+                  <button className="danger" onClick={() => deleteOutput(selectedClip)} disabled={Boolean(busy)}>
+                    <Trash2 size={16} />
+                    Delete
+                  </button>
                   <button
                     className="secondary"
                     onClick={() => renderClip(selectedClip)}
-                    disabled={Boolean(busy) || !hasMediaAsset}
+                    disabled={Boolean(busy) || !hasMediaAsset || renderTypes.length === 0}
                   >
                     <Play size={16} />
                     Render
                   </button>
                 </div>
 
+                {renderError && (
+                  <p className="render-error" role="alert">
+                    {renderError}
+                  </p>
+                )}
+
                 <div className="render-list">
-                  {selectedClip.rendered_clips.map((rendered) =>
+                  {selectedClip.rendered_clips.filter(showRenderedClip).map((rendered) =>
                     rendered.status === "completed" ? (
                       <a key={rendered.id} href={api.downloadRenderUrl(rendered.id)} target="_blank" rel="noreferrer">
-                        {rendered.render_type} · {rendered.status}
+                        {renderTypeLabel(rendered.render_type)} · {rendered.status}
                       </a>
                     ) : (
                       <div key={rendered.id} className={`render-item ${rendered.status}`}>
-                        <span>{rendered.render_type} · {rendered.status}</span>
+                        <span>{renderTypeLabel(rendered.render_type)} · {rendered.status}</span>
                         {rendered.error && <small>{rendered.error}</small>}
                       </div>
                     )
@@ -1427,7 +1558,7 @@ export default function App() {
                 </div>
               </>
             ) : (
-              <div className="empty">Select a clip</div>
+              <div className="empty">Select an output</div>
             )}
           </section>
         </div>
@@ -1518,13 +1649,6 @@ export default function App() {
                   />
                 </label>
               </div>
-              <label>
-                Theme
-                <input
-                  value={episodeDetailsForm.theme}
-                  onChange={(event) => setEpisodeDetailsForm({ ...episodeDetailsForm, theme: event.target.value })}
-                />
-              </label>
             </div>
 
             {episodeDetailsMessage && (
@@ -1654,91 +1778,24 @@ function formatTime(seconds: number) {
   return `${minutes}:${sec.toString().padStart(2, "0")}`;
 }
 
+function analysisEventProgress(event: AnalysisEvent) {
+  return typeof event.progress === "number" ? clampProgress(event.progress) : 0;
+}
+
+function isTerminalAnalysisEvent(event: AnalysisEvent) {
+  return event.level === "error" || event.event_type.endsWith(".completed");
+}
+
+function isBeforeIsoTime(value: string, reference: string) {
+  const time = Date.parse(value);
+  const referenceTime = Date.parse(reference);
+  return Number.isFinite(time) && Number.isFinite(referenceTime) && time < referenceTime;
+}
+
 function clampProgress(progress: number) {
   return Math.min(100, Math.max(0, Math.round(progress)));
 }
 
-function eventProgress(event: EpisodeEvent) {
-  return typeof event.progress === "number" ? clampProgress(event.progress) : null;
-}
-
-function isCompletedEpisodeEvent(event: EpisodeEvent) {
-  if (event.level === "error") return false;
-  return eventProgress(event) === 100 || event.event_type.endsWith(".completed");
-}
-
-function isDefaultEpisodeTitle(title?: string | null) {
-  return !title || title.trim().toLowerCase() === "untitled episode";
-}
-
-function mergeEpisodeEvent(events: EpisodeEvent[], event: EpisodeEvent) {
-  const visibleEvents = events.filter((item) => !isCompletedEpisodeEvent(item));
-  const withoutDuplicate = visibleEvents.filter((item) => item.id !== event.id && !sameEpisodeEvent(item, event));
-  if (isCompletedEpisodeEvent(event)) {
-    return pruneCompletedOperationEvents(withoutDuplicate, event);
-  }
-  return [event, ...withoutDuplicate].slice(0, EVENT_HISTORY_LIMIT);
-}
-
-function pruneCompletedOperationEvents(events: EpisodeEvent[], completedEvent: EpisodeEvent) {
-  const group = eventOperationGroup(completedEvent);
-  return events.filter((event) => eventOperationGroup(event) !== group).slice(0, EVENT_HISTORY_LIMIT);
-}
-
-function eventOperationGroup(event: EpisodeEvent) {
-  const rawGroup = event.event_type.split(".")[0] || "system";
-  return rawGroup === "llm" ? "analysis" : rawGroup;
-}
-
-function sameEpisodeEvent(left: EpisodeEvent, right: EpisodeEvent) {
-  if (left.event_type !== right.event_type) return false;
-  if (
-    typeof left.data.analysis_run_id === "string" &&
-    left.data.analysis_run_id === right.data.analysis_run_id
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function eventStorageKey(episodeId: string) {
-  return `aurora-prism:episode-events:${episodeId}`;
-}
-
-function readStoredEpisodeEvents(episodeId: string) {
-  try {
-    const stored = window.localStorage.getItem(eventStorageKey(episodeId));
-    if (!stored) return [];
-    const parsed = JSON.parse(stored);
-    return Array.isArray(parsed)
-      ? (parsed as EpisodeEvent[])
-          .filter((event) => !isCompletedEpisodeEvent(event))
-          .slice(0, EVENT_HISTORY_LIMIT)
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function storeEpisodeEvents(episodeId: string, events: EpisodeEvent[]) {
-  try {
-    const visibleEvents = events.filter((event) => !isCompletedEpisodeEvent(event));
-    window.localStorage.setItem(
-      eventStorageKey(episodeId),
-      JSON.stringify(visibleEvents.slice(0, EVENT_HISTORY_LIMIT))
-    );
-  } catch {
-    // Browser storage may be unavailable in private or restricted sessions.
-  }
-}
-
-function removeStoredEpisodeEvents(episodeId: string) {
-  try {
-    window.localStorage.removeItem(eventStorageKey(episodeId));
-  } catch {
-    // Browser storage may be unavailable in private or restricted sessions.
-  }
-}
 
 function readStoredAuthSession() {
   try {

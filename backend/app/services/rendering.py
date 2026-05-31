@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,14 +39,25 @@ async def render_clip(session: AsyncSession, clip_id: str, request: RenderReques
             logger.warning("Rendering failed, clip not found clip_id={}", clip_id)
             raise ValueError("Clip not found")
 
+        render_types = _normalize_render_types(request.render_types)
+        if not render_types:
+            safe_update(span, output={"rendered": []})
+            logger.info("Rendering skipped, no render output types selected clip_id={}", clip_id)
+            return []
+
         video_asset = await _source_asset(session, clip.episode_id, ["video"])
         audio_asset = await _source_asset(session, clip.episode_id, ["audio", "video"])
         if video_asset is None and audio_asset is None:
             raise RenderPreconditionError(
                 "Upload a video or audio asset before rendering clips. This episode has no usable media source."
             )
+        ffmpeg = _ffmpeg_executable()
+        if ffmpeg is None:
+            raise RenderPreconditionError(
+                "FFmpeg is not installed or not available in PATH. Install ffmpeg locally, "
+                "or run the backend with Docker where ffmpeg is included."
+            )
         outputs: list[RenderedClip] = []
-        render_types = _normalize_render_types(request.render_types, video_asset is not None)
         logger.debug(
             "Render assets resolved clip_id={} episode_id={} has_video={} has_audio_or_video={} normalized_render_types={}",
             clip_id,
@@ -59,12 +71,12 @@ async def render_clip(session: AsyncSession, clip_id: str, request: RenderReques
             record = RenderedClip(clip_id=clip.id, render_type=render_type, status="running")
             session.add(record)
             await session.flush()
-            source = video_asset if render_type in {"original", "vertical"} else audio_asset
+            source = video_asset if render_type == "video" else audio_asset
             try:
                 if source is None:
                     raise RuntimeError("No compatible media asset is available for this render type")
                 output_path = _output_path(clip, render_type)
-                command = _command_for(render_type, source.path, output_path, clip)
+                command = _command_for(render_type, source.path, output_path, clip, ffmpeg)
                 logger.info(
                     "Render started clip_id={} render_type={} asset_id={} source={} output={}",
                     clip.id,
@@ -121,19 +133,10 @@ async def render_clip(session: AsyncSession, clip_id: str, request: RenderReques
         return outputs
 
 
-def _normalize_render_types(render_types: list[str], has_video: bool) -> list[str]:
+def _normalize_render_types(render_types: list[str]) -> list[str]:
     normalized: list[str] = []
     for render_type in render_types:
-        if render_type in {"original", "vertical"} and not has_video:
-            replacement = "waveform" if render_type == "vertical" else "audio"
-            if replacement not in normalized:
-                normalized.append(replacement)
-            logger.debug(
-                "Render type remapped requested={} replacement={} reason=no_video",
-                render_type,
-                replacement,
-            )
-        elif render_type not in normalized:
+        if render_type not in normalized:
             normalized.append(render_type)
     return normalized
 
@@ -195,19 +198,41 @@ def _output_path(clip: ClipCandidate, render_type: str) -> Path:
     settings = get_settings()
     directory = settings.exports_dir / clip.episode_id / "clips"
     directory.mkdir(parents=True, exist_ok=True)
-    stem = safe_filename(f"{clip.rank:02d}-{clip.clip_type}-{render_type}-{int(clip.start_seconds)}")
+    stem = safe_filename(f"{clip.rank:02d}-{clip.target_platform}-{render_type}-{int(clip.start_seconds)}")
     suffix = ".m4a" if render_type == "audio" else ".mp4"
     output = directory / f"{stem}{suffix}"
     logger.debug("Render output path prepared clip_id={} render_type={} path={}", clip.id, render_type, output)
     return output
 
 
-def _command_for(render_type: str, source: Path, output: Path, clip: ClipCandidate) -> list[str]:
+def _ffmpeg_executable() -> str | None:
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+    return _imageio_ffmpeg_executable()
+
+
+def _imageio_ffmpeg_executable() -> str | None:
+    try:
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    executable = imageio_ffmpeg.get_ffmpeg_exe()
+    return executable if executable and Path(executable).exists() else None
+
+
+def _command_for(
+    render_type: str,
+    source: Path,
+    output: Path,
+    clip: ClipCandidate,
+    ffmpeg: str,
+) -> list[str]:
     start = f"{clip.start_seconds:.3f}"
     duration = f"{clip.duration_seconds:.3f}"
-    if render_type == "original":
+    if render_type == "video":
         return [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-ss",
             start,
@@ -215,26 +240,6 @@ def _command_for(render_type: str, source: Path, output: Path, clip: ClipCandida
             str(source),
             "-t",
             duration,
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    if render_type == "vertical":
-        return [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            start,
-            "-i",
-            str(source),
-            "-t",
-            duration,
-            "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
             "-c:v",
             "libx264",
             "-c:a",
@@ -245,7 +250,7 @@ def _command_for(render_type: str, source: Path, output: Path, clip: ClipCandida
         ]
     if render_type == "audio":
         return [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-ss",
             start,
@@ -258,36 +263,15 @@ def _command_for(render_type: str, source: Path, output: Path, clip: ClipCandida
             "aac",
             str(output),
         ]
-    if render_type == "waveform":
-        return [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            start,
-            "-i",
-            str(source),
-            "-t",
-            duration,
-            "-filter_complex",
-            "[0:a]showwaves=s=1080x520:mode=line:colors=0x6EE7B7[v];"
-            "color=c=0x111827:s=1080x1920[bg];[bg][v]overlay=0:700",
-            "-map",
-            "0:a",
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
     raise ValueError(f"Unsupported render type: {render_type}")
 
 
 def _run(command: list[str]) -> None:
     logger.debug("Running render command command={}", command)
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError("FFmpeg is not installed or not available in PATH") from exc
     if completed.returncode != 0:
         logger.warning("Render command failed returncode={} stderr={}", completed.returncode, completed.stderr)
         raise RuntimeError(completed.stderr.strip() or "ffmpeg failed")

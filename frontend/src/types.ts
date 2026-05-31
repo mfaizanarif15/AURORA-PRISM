@@ -5,25 +5,11 @@ export type Episode = {
   guest_role?: string | null;
   guest_company?: string | null;
   recording_date?: string | null;
-  theme?: string | null;
   status: string;
   clip_count: number;
   asset_count: number;
   media_asset_count: number;
   transcript_segment_count: number;
-};
-
-export type ClipScore = {
-  total_score: number;
-  icp_relevance: number;
-  tkxel_alignment: number;
-  hook_strength: number;
-  virality_potential: number;
-  business_value: number;
-  guest_authority: number;
-  topic_fit: number;
-  audio_confidence: number;
-  explanation: string;
 };
 
 export type ClipMetadata = {
@@ -47,7 +33,16 @@ export type RenderedClip = {
   error?: string | null;
 };
 
-export type EpisodeEvent = {
+export type AnalysisRun = {
+  id: string;
+  episode_id: string;
+  status: string;
+  mode: string;
+  summary?: string | null;
+  generated_clip_count: number;
+};
+
+export type AnalysisEvent = {
   id: number;
   episode_id: string;
   event_type: string;
@@ -58,20 +53,10 @@ export type EpisodeEvent = {
   created_at: string;
 };
 
-export type AnalysisRun = {
-  id: string;
-  episode_id: string;
-  status: string;
-  mode: string;
-  summary?: string | null;
-  generated_clip_count: number;
-};
-
 export type AuthUser = {
   id: string;
   username: string;
   display_name: string;
-  role: string;
 };
 
 export type AuthSession = {
@@ -92,6 +77,8 @@ export type Clip = {
   id: string;
   episode_id: string;
   clip_type: "short" | "highlight";
+  target_platform: string;
+  purpose: string;
   moment_type: string;
   status: string;
   start_seconds: number;
@@ -100,18 +87,24 @@ export type Clip = {
   excerpt: string;
   reasoning: string;
   rank: number;
-  score?: ClipScore | null;
   metadata: ClipMetadata[];
   rendered_clips: RenderedClip[];
 };
 
+export type AnalysisSectionKey = "tiktok" | "instagram_reels" | "youtube_shorts" | "linkedin" | "highlights";
+
+export type AnalysisSectionConfig = {
+  enabled: boolean;
+  target_count: number;
+  duration_min_seconds: number | null;
+  duration_max_seconds: number | null;
+};
+
 export type AnalysisPayload = {
   ai_provider: "azure_openai" | "openai";
-  clip_types: Array<"short" | "highlight">;
   duration_min_seconds?: number | null;
   duration_max_seconds?: number | null;
-  target_clip_count: number;
-  platforms: string[];
   custom_instructions?: string | null;
   mode: "mock" | "hybrid" | "openai";
+  sections: Record<AnalysisSectionKey, AnalysisSectionConfig>;
 };

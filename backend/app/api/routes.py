@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -16,6 +15,8 @@ from app.models import (
     ApprovalEvent,
     Asset,
     ClipCandidate,
+    ClipMetadata,
+    ClipScore,
     Episode,
     EpisodeContext,
     ExportPack,
@@ -34,6 +35,7 @@ from app.schemas.api import (
     AuthSessionRead,
     AuthSignupRequest,
     AuthUserRead,
+    CLIP_STATUSES,
     ClipRead,
     ClipStatusUpdate,
     EpisodeAutoTitleRequest,
@@ -46,8 +48,14 @@ from app.schemas.api import (
     TranscriptUploadResult,
 )
 from app.core.config import get_settings
-from app.services.ai_clients import chat_model_name, make_chat_client, provider_status
+from app.services.ai_clients import provider_status
 from app.services.analysis import analyze_episode
+from app.services.analysis_events import analysis_event_stream, publish_analysis_event
+from app.services.audio_transcription import (
+    AudioTranscriptionUnavailable,
+    is_transcribable_upload,
+    transcribe_audio_file,
+)
 from app.services.auth import (
     AuthUser,
     authenticate_credentials,
@@ -61,7 +69,7 @@ from app.services.auth import (
 )
 from app.services.assets import save_upload
 from app.services.exports import create_export_pack
-from app.services.events import episode_event_stream, publish_episode_event
+from app.services.llm import suggest_episode_title
 from app.services.observability import langfuse_status
 from app.services.rendering import RenderPreconditionError, render_clip
 from app.services.transcripts import parse_transcript
@@ -87,7 +95,6 @@ async def login(
             user_record = User(
                 username=normalize_username(configured.username),
                 display_name=configured.display_name,
-                role=configured.role,
                 password_hash=hash_password(payload.password),
             )
             session.add(user_record)
@@ -128,7 +135,6 @@ async def signup(
     user_record = User(
         username=username,
         display_name=display_name,
-        role="Content Operations",
         password_hash=hash_password(payload.password),
         last_login_at=utcnow(),
     )
@@ -231,9 +237,10 @@ async def logout(request: Request) -> dict[str, str]:
 async def ai_providers() -> dict:
     status = provider_status(get_settings())
     logger.debug(
-        "AI provider status requested default_provider={} azure_configured={} openai_configured={}",
+        "AI provider status requested default_provider={} azure_configured={} transcription_configured={} openai_configured={}",
         status["default_provider"],
         status["azure_openai_configured"],
+        status["azure_openai_transcription_configured"],
         status["openai_configured"],
     )
     return status
@@ -331,13 +338,6 @@ async def update_episode(
     await session.commit()
     await session.refresh(episode)
     logger.info("Episode updated episode_id={} title={}", episode.id, episode.title)
-    await publish_episode_event(
-        episode_id,
-        "episode.updated",
-        "Episode details updated",
-        progress=100,
-        data={"title": episode.title},
-    )
     return await _episode_read(session, episode)
 
 
@@ -354,38 +354,23 @@ async def auto_title_episode(
         raise HTTPException(status_code=404, detail="Episode not found")
 
     context = await _episode_context(session, episode_id)
-    title = await _episode_title_suggestion(session, episode, context, payload.ai_provider)
+    transcript_result = await session.execute(
+        select(TranscriptSegment)
+        .where(TranscriptSegment.episode_id == episode.id)
+        .order_by(TranscriptSegment.start_seconds)
+        .limit(8)
+    )
+    title = await suggest_episode_title(
+        episode,
+        context,
+        transcript_result.scalars().all(),
+        payload.ai_provider,
+    )
     episode.title = title
     await session.commit()
     await session.refresh(episode)
     logger.info("Episode auto-title applied episode_id={} title={}", episode_id, title)
-    await publish_episode_event(
-        episode_id,
-        "episode.auto_title",
-        "Episode title updated",
-        progress=100,
-        data={"title": title},
-    )
     return await _episode_read(session, episode)
-
-
-@router.get("/episodes/{episode_id}/events")
-async def stream_episode_events(
-    episode_id: str, request: Request, session: AsyncSession = Depends(get_session)
-) -> StreamingResponse:
-    if await _get_owned_episode(session, episode_id, _current_owner_user_id(request)) is None:
-        logger.warning("SSE stream rejected, episode not found episode_id={}", episode_id)
-        raise HTTPException(status_code=404, detail="Episode not found")
-    logger.info("Episode SSE stream requested episode_id={}", episode_id)
-    return StreamingResponse(
-        episode_event_stream(episode_id, request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 @router.patch("/episodes/{episode_id}/context")
@@ -411,13 +396,6 @@ async def upsert_context(
             setattr(context, key, value)
     await session.commit()
     logger.info("Saved episode context episode_id={} created={}", episode_id, created)
-    await publish_episode_event(
-        episode_id,
-        "context.saved",
-        "Episode context saved",
-        progress=100,
-        data={"created": created},
-    )
     return {"status": "saved", "episode_id": episode_id}
 
 
@@ -457,13 +435,6 @@ async def upload_asset(
         asset.filename,
         bool(extracted_text),
     )
-    await publish_episode_event(
-        episode_id,
-        "asset.uploaded",
-        f"{asset_type.replace('_', ' ').title()} uploaded",
-        progress=100,
-        data={"asset_id": asset.id, "asset_type": asset_type, "filename": asset.filename},
-    )
     return _asset_read(asset)
 
 
@@ -480,22 +451,91 @@ async def upload_transcript(
         logger.warning("Cannot upload transcript, episode not found episode_id={}", episode_id)
         raise HTTPException(status_code=404, detail="Episode not found")
     if file is not None:
-        raw = (await file.read()).decode("utf-8", errors="ignore")
-        source_format = Path(file.filename or "transcript.txt").suffix.lstrip(".") or source_format
-        logger.info(
-            "Transcript file received episode_id={} filename={} source_format={}",
-            episode_id,
-            file.filename,
-            source_format,
-        )
+        file_suffix = Path(file.filename or "").suffix.lower()
+        if is_transcribable_upload(file.filename, file.content_type):
+            path, _ = await save_upload(episode_id, file, "audio")
+            audio_asset = Asset(
+                episode_id=episode_id,
+                asset_type="audio",
+                filename=file.filename or path.name,
+                content_type=file.content_type,
+                path=str(path),
+                tags=["transcript_source"],
+                is_primary=True,
+            )
+            session.add(audio_asset)
+            try:
+                parsed = await transcribe_audio_file(path, file.content_type)
+            except AudioTranscriptionUnavailable as exc:
+                logger.info("Audio transcription skipped episode_id={} reason={}", episode_id, exc)
+                await session.commit()
+                return TranscriptUploadResult(
+                    segment_count=0,
+                    first_timestamp=None,
+                    last_timestamp=None,
+                )
+            except Exception as exc:
+                logger.warning("Audio transcription failed episode_id={} error={}", episode_id, exc)
+                await session.rollback()
+                raise HTTPException(status_code=400, detail="Audio transcription failed") from exc
+            if not parsed:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Audio transcription produced no transcript text",
+                )
+            source_format = "audio"
+            logger.info(
+                "Audio transcript parsed episode_id={} filename={} segment_count={}",
+                episode_id,
+                file.filename,
+                len(parsed),
+            )
+        elif file_suffix in {".pdf", ".docx"}:
+            path, extracted_text = await save_upload(episode_id, file, "transcript_source")
+            if not extracted_text:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transcript document did not contain extractable text",
+                )
+            session.add(
+                Asset(
+                    episode_id=episode_id,
+                    asset_type="transcript_source",
+                    filename=file.filename or path.name,
+                    content_type=file.content_type,
+                    path=str(path),
+                    extracted_text=extracted_text,
+                    tags=["transcript_source"],
+                    is_primary=False,
+                )
+            )
+            source_format = file_suffix.lstrip(".") or source_format
+            parsed = parse_transcript(extracted_text, source_format)
+            logger.info(
+                "Transcript document parsed episode_id={} filename={} segment_count={}",
+                episode_id,
+                file.filename,
+                len(parsed),
+            )
+        else:
+            raw = (await file.read()).decode("utf-8", errors="ignore")
+            source_format = Path(file.filename or "transcript.txt").suffix.lstrip(".") or source_format
+            logger.info(
+                "Transcript file received episode_id={} filename={} source_format={}",
+                episode_id,
+                file.filename,
+                source_format,
+            )
+            parsed = parse_transcript(raw, source_format)
     elif content:
         raw = content
         logger.info("Transcript content received episode_id={} source_format={}", episode_id, source_format)
+        parsed = parse_transcript(raw, source_format)
     else:
         logger.warning("Transcript upload missing content episode_id={}", episode_id)
         raise HTTPException(status_code=400, detail="Provide transcript content or file")
 
-    parsed = parse_transcript(raw, source_format)
     await session.execute(delete(TranscriptSegment).where(TranscriptSegment.episode_id == episode_id))
     for segment in parsed:
         session.add(
@@ -516,17 +556,6 @@ async def upload_transcript(
         parsed[0].start_seconds if parsed else None,
         parsed[-1].end_seconds if parsed else None,
     )
-    await publish_episode_event(
-        episode_id,
-        "transcript.saved",
-        f"Transcript saved with {len(parsed)} segments",
-        progress=100,
-        data={
-            "segment_count": len(parsed),
-            "first_timestamp": parsed[0].start_seconds if parsed else None,
-            "last_timestamp": parsed[-1].end_seconds if parsed else None,
-        },
-    )
     return TranscriptUploadResult(
         segment_count=len(parsed),
         first_timestamp=parsed[0].start_seconds if parsed else None,
@@ -545,13 +574,13 @@ async def analyze(
         logger.warning("Analysis rejected, episode not found episode_id={}", episode_id)
         raise HTTPException(status_code=404, detail="Episode not found")
     logger.info(
-        "Analysis requested episode_id={} mode={} provider={} target_clip_count={}",
+        "Analysis requested episode_id={} mode={} provider={} sections={}",
         episode_id,
         payload.mode,
         payload.ai_provider,
-        payload.target_clip_count,
+        {key: config.target_count for key, config in payload.enabled_sections()},
     )
-    await publish_episode_event(
+    await publish_analysis_event(
         episode_id,
         "analysis.requested",
         "Analysis request received",
@@ -559,15 +588,14 @@ async def analyze(
         data={
             "mode": payload.mode,
             "provider": payload.ai_provider,
-            "target_clip_count": payload.target_clip_count,
-            "clip_types": payload.clip_types,
+            "sections": {key: config.target_count for key, config in payload.enabled_sections()},
         },
     )
     try:
         run = await analyze_episode(session, episode_id, payload)
     except ValueError as exc:
         logger.warning("Analysis rejected episode_id={} error={}", episode_id, exc)
-        await publish_episode_event(
+        await publish_analysis_event(
             episode_id,
             "analysis.failed",
             str(exc),
@@ -582,10 +610,10 @@ async def analyze(
         run.id,
         count,
     )
-    await publish_episode_event(
+    await publish_analysis_event(
         episode_id,
         "analysis.completed",
-        f"Analysis completed with {count} clips",
+        f"Analysis completed with {count} outputs",
         level="success",
         progress=100,
         data={"analysis_run_id": run.id, "generated_clip_count": count},
@@ -600,11 +628,34 @@ async def analyze(
     )
 
 
+@router.get("/episodes/{episode_id}/analysis-events")
+async def stream_analysis_events(
+    episode_id: str,
+    request: Request,
+    since: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    if await _get_owned_episode(session, episode_id, _current_owner_user_id(request)) is None:
+        logger.warning("Analysis SSE stream rejected, episode not found episode_id={}", episode_id)
+        raise HTTPException(status_code=404, detail="Episode not found")
+    logger.info("Analysis SSE stream requested episode_id={}", episode_id)
+    return StreamingResponse(
+        analysis_event_stream(episode_id, request, since),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/episodes/{episode_id}/clips", response_model=list[ClipRead])
 async def list_clips(
     episode_id: str,
     request: Request,
     clip_type: str | None = None,
+    target_platform: str | None = None,
     status: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[ClipRead]:
@@ -615,22 +666,26 @@ async def list_clips(
         select(ClipCandidate)
         .where(ClipCandidate.episode_id == episode_id)
         .options(
-            selectinload(ClipCandidate.score),
             selectinload(ClipCandidate.metadata_items),
             selectinload(ClipCandidate.rendered_clips),
         )
-        .order_by(ClipCandidate.rank)
+        .order_by(ClipCandidate.target_platform, ClipCandidate.rank)
     )
     if clip_type:
         statement = statement.where(ClipCandidate.clip_type == clip_type)
+    if target_platform:
+        statement = statement.where(ClipCandidate.target_platform == target_platform)
     if status:
+        if status not in CLIP_STATUSES:
+            raise HTTPException(status_code=400, detail="Invalid clip status")
         statement = statement.where(ClipCandidate.status == status)
     result = await session.execute(statement)
     clips = [_clip_read(clip) for clip in result.scalars()]
     logger.info(
-        "Listed clips episode_id={} clip_type={} status={} count={}",
+        "Listed clips episode_id={} clip_type={} target_platform={} status={} count={}",
         episode_id,
         clip_type,
+        target_platform,
         status,
         len(clips),
     )
@@ -675,17 +730,33 @@ async def update_clip_status(
         payload.status,
         payload.user_name,
     )
-    await publish_episode_event(
-        clip.episode_id,
-        "clip.status",
-        f"Clip marked {payload.status.replace('_', ' ')}",
-        progress=100,
-        data={"clip_id": clip_id, "status": payload.status, "user_name": payload.user_name},
-    )
     refreshed = await _get_owned_clip(session, clip_id, owner_user_id, include_details=True)
     if refreshed is None:
         raise HTTPException(status_code=404, detail="Clip not found")
     return _clip_read(refreshed)
+
+
+@router.delete("/clips/{clip_id}")
+async def delete_clip(
+    clip_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    owner_user_id = _current_owner_user_id(request)
+    clip = await _get_owned_clip(session, clip_id, owner_user_id)
+    if clip is None:
+        logger.warning("Cannot delete clip, clip not found clip_id={}", clip_id)
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    episode_id = clip.episode_id
+    await session.execute(delete(RenderedClip).where(RenderedClip.clip_id == clip_id))
+    await session.execute(delete(ApprovalEvent).where(ApprovalEvent.clip_id == clip_id))
+    await session.execute(delete(ClipMetadata).where(ClipMetadata.clip_id == clip_id))
+    await session.execute(delete(ClipScore).where(ClipScore.clip_id == clip_id))
+    await session.delete(clip)
+    await session.commit()
+    logger.info("Deleted clip clip_id={} episode_id={}", clip_id, episode_id)
+    return {"status": "deleted", "clip_id": clip_id}
 
 
 @router.post("/clips/{clip_id}/render", response_model=list[dict])
@@ -712,26 +783,6 @@ async def render(
         clip_id,
         [{"id": item.id, "type": item.render_type, "status": item.status} for item in rendered],
     )
-    clip = await session.get(ClipCandidate, clip_id)
-    if clip is not None:
-        completed = sum(1 for item in rendered if item.status == "completed")
-        failed = sum(1 for item in rendered if item.status == "failed")
-        await publish_episode_event(
-            clip.episode_id,
-            "render.completed",
-            f"Render finished: {completed} completed, {failed} failed",
-            level="success" if failed == 0 else "warning",
-            progress=100,
-            data={
-                "clip_id": clip_id,
-                "completed": completed,
-                "failed": failed,
-                "rendered": [
-                    {"id": item.id, "render_type": item.render_type, "status": item.status}
-                    for item in rendered
-                ],
-            },
-        )
     return [
         {
             "id": item.id,
@@ -763,14 +814,6 @@ async def export_episode(
         pack.id,
         pack.status,
         pack.filename,
-    )
-    await publish_episode_event(
-        episode_id,
-        "export.completed",
-        f"Export {pack.status}",
-        level="success" if pack.status == "completed" else "warning",
-        progress=100,
-        data={"export_pack_id": pack.id, "status": pack.status, "filename": pack.filename},
     )
     return ExportPackRead(
         id=pack.id,
@@ -853,7 +896,6 @@ async def _get_owned_clip(
         )
     if include_details:
         statement = statement.options(
-            selectinload(ClipCandidate.score),
             selectinload(ClipCandidate.metadata_items),
             selectinload(ClipCandidate.rendered_clips),
         )
@@ -892,101 +934,6 @@ async def _episode_context(session: AsyncSession, episode_id: str) -> EpisodeCon
     return result.scalar_one_or_none()
 
 
-async def _episode_title_suggestion(
-    session: AsyncSession,
-    episode: Episode,
-    context: EpisodeContext | None,
-    provider: str,
-) -> str:
-    fallback = _heuristic_episode_title(episode, context)
-    settings = get_settings()
-    try:
-        client = make_chat_client(settings, provider)
-        model = chat_model_name(settings, provider)
-        transcript_result = await session.execute(
-            select(TranscriptSegment)
-            .where(TranscriptSegment.episode_id == episode.id)
-            .order_by(TranscriptSegment.start_seconds)
-            .limit(8)
-        )
-        transcript = " ".join(segment.text for segment in transcript_result.scalars())
-        prompt_payload = {
-            "episode": {
-                "current_title": episode.title,
-                "guest_name": episode.guest_name,
-                "guest_role": episode.guest_role,
-                "guest_company": episode.guest_company,
-                "theme": episode.theme,
-            },
-            "context": _context_summary(context),
-            "transcript_excerpt": transcript[:1800],
-        }
-        completion = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Create concise, professional podcast episode titles. "
-                        "Return valid JSON only with a title field."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Suggest one specific title under 90 characters from this context. "
-                        "Avoid clickbait and avoid generic words like Untitled.\n"
-                        f"{json.dumps(prompt_payload, ensure_ascii=True)}"
-                    ),
-                },
-            ],
-            temperature=0.2,
-            max_tokens=120,
-            response_format={"type": "json_object"},
-        )
-        raw = completion.choices[0].message.content or "{}"
-        parsed = json.loads(raw)
-        title = _clean_title(parsed.get("title"))
-        if title:
-            return title
-    except Exception as exc:
-        logger.warning("LLM episode title suggestion failed episode_id={} error={}", episode.id, exc)
-    return fallback
-
-
-def _context_summary(context: EpisodeContext | None) -> dict:
-    if context is None:
-        return {}
-    return {
-        "target_audience": context.target_audience,
-        "hot_topic": context.hot_topic,
-        "business_objectives": context.business_objectives,
-        "episode_plan": context.episode_plan,
-        "editor_notes": context.editor_notes,
-    }
-
-
-def _heuristic_episode_title(episode: Episode, context: EpisodeContext | None) -> str:
-    topic = _clean_title(context.hot_topic if context else None) or _clean_title(episode.theme)
-    guest = _clean_title(episode.guest_name)
-    if guest and topic:
-        return _clean_title(f"{guest} on {topic}") or "Untitled episode"
-    if topic:
-        return topic
-    if guest:
-        return _clean_title(f"Conversation with {guest}") or "Untitled episode"
-    return "Untitled episode"
-
-
-def _clean_title(value: object) -> str | None:
-    if value is None:
-        return None
-    title = " ".join(str(value).strip().split())
-    if not title:
-        return None
-    return title[:90].rsplit(" ", 1)[0] if len(title) > 90 else title
-
-
 async def _episode_read(session: AsyncSession, episode: Episode) -> EpisodeRead:
     return EpisodeRead(
         id=episode.id,
@@ -995,7 +942,6 @@ async def _episode_read(session: AsyncSession, episode: Episode) -> EpisodeRead:
         guest_role=episode.guest_role,
         guest_company=episode.guest_company,
         recording_date=episode.recording_date,
-        theme=episode.theme,
         status=episode.status,
         clip_count=await _count(session, ClipCandidate, ClipCandidate.episode_id == episode.id),
         asset_count=await _count(session, Asset, Asset.episode_id == episode.id),
@@ -1032,7 +978,6 @@ def _auth_user_from_record(user: User) -> AuthUser:
         id=user.id,
         username=user.username,
         display_name=user.display_name,
-        role=user.role,
     )
 
 
@@ -1041,7 +986,6 @@ def _auth_user_read(user: AuthUser) -> AuthUserRead:
         id=user.id,
         username=user.username,
         display_name=user.display_name,
-        role=user.role,
     )
 
 
@@ -1062,6 +1006,8 @@ def _clip_read(clip: ClipCandidate) -> ClipRead:
         id=clip.id,
         episode_id=clip.episode_id,
         clip_type=clip.clip_type,
+        target_platform=clip.target_platform,
+        purpose=clip.purpose,
         moment_type=clip.moment_type,
         status=clip.status,
         start_seconds=clip.start_seconds,
@@ -1070,7 +1016,6 @@ def _clip_read(clip: ClipCandidate) -> ClipRead:
         excerpt=clip.excerpt,
         reasoning=clip.reasoning,
         rank=clip.rank,
-        score=clip.score,
         metadata=clip.metadata_items,
         rendered_clips=clip.rendered_clips,
     )

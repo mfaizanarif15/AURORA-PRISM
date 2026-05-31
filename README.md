@@ -1,6 +1,6 @@
 # AURORA PRISM
 
-AURORA PRISM is a FastAPI + React + PostgreSQL MVP for podcast clip discovery. It accepts video, audio, transcript, guest/context data, and brand references; recommends short-form clips plus 3-6 minute highlights; supports approval; renders draft clips; and exports editor/social handoff packs.
+AURORA PRISM is a FastAPI + React + PostgreSQL MVP for podcast output discovery. It accepts video, audio, transcript, and guest/context data; recommends section-specific TikTok, Reels, YouTube Shorts, LinkedIn, and highlight outputs; supports approval; renders drafts; and exports editor/social handoff packs.
 
 For complete setup and startup instructions, see [SETUP.md](SETUP.md).
 For backend endpoint contracts, see [API_REFERENCE.md](API_REFERENCE.md).
@@ -44,8 +44,9 @@ docker compose exec backend python scripts/seed_demo.py
 - PostgreSQL storage with 12 application tables documented in [DATABASE_TABLES.md](DATABASE_TABLES.md)
 - FFmpeg rendering inside the backend container
 - `uv` is used for Python dependency management from `backend/pyproject.toml`
-- Mock, hybrid, and LLM-only analysis modes for clip selection and platform metadata
+- LangGraph + Azure OpenAI specialist analysis for TikTok, Reels, YouTube Shorts, LinkedIn, and Highlights
 - Azure OpenAI is the default AI provider, with standard OpenAI available as the second option
+- Audio transcript uploads use OpenAI Whisper when `OPENAI_API_KEY` is configured; otherwise audio is saved and transcription is skipped
 - Optional Langfuse observability for analysis, render, and export traces
 
 Local backend with `uv`:
@@ -84,6 +85,7 @@ AZURE_OPENAI_ENDPOINT=
 AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_API_VERSION=2025-03-01-preview
 AZURE_OPENAI_CHAT_DEPLOYMENT=
+AZURE_OPENAI_TRANSCRIPTION_DEPLOYMENT=
 ```
 
 The backend also supports the existing aliases `AZURE_API_BASE`, `AZURE_API_KEY`, `AZURE_API_VERSION`, and `AZURE_DEPLOYMENT`.
@@ -93,7 +95,10 @@ For standard OpenAI, use:
 ```bash
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TRANSCRIPTION_MODEL=whisper-1
 ```
+
+Audio files uploaded as transcript sources are transcribed with standard OpenAI Whisper when `OPENAI_API_KEY` is set. If neither OpenAI Whisper nor an Azure transcription deployment is configured, the audio asset is still saved and transcript creation is skipped.
 
 Analysis modes:
 
@@ -112,9 +117,9 @@ npm run dev
 VITE_PROXY_TARGET=http://localhost:8101 npm run dev
 ```
 
-The UI includes login/logout, episode intake, context setup, media/transcript uploads, clip instructions, PRISM Board filters, clip detail, approval actions, render controls, and export generation.
+The UI includes login/logout, episode intake, context setup, media/transcript uploads, output section controls, grouped output results, detail review, approval actions, render controls, and export generation.
 
-## Clip Modes
+## Output Modes
 
 - Shorts: default 30-90 seconds for TikTok, YouTube Shorts, Instagram/Reels, and LinkedIn short posts.
 - Highlights: default 3-6 minutes for deeper expert insight or story-based excerpts.

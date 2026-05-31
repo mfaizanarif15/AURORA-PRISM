@@ -8,6 +8,7 @@ from app.api.routes import (
     _get_owned_export,
     _get_owned_render,
     delete_episode,
+    delete_clip,
     update_episode,
 )
 from app.db.base import Base
@@ -48,7 +49,7 @@ async def test_owned_child_lookups_filter_by_episode_owner() -> None:
             reasoning="A strong reason.",
             rank=1,
         )
-        rendered = RenderedClip(id="render-b", clip_id=clip.id, render_type="original", status="completed")
+        rendered = RenderedClip(id="render-b", clip_id=clip.id, render_type="video", status="completed")
         export = ExportPack(id="export-b", episode_id=episode.id, status="completed", manifest={})
         session.add_all([user_a, user_b, episode, run, clip, rendered, export])
         await session.commit()
@@ -110,7 +111,7 @@ async def test_delete_episode_removes_owned_episode_and_children() -> None:
             reasoning="A strong reason.",
             rank=1,
         )
-        rendered = RenderedClip(id="render-a", clip_id=clip.id, render_type="original", status="completed")
+        rendered = RenderedClip(id="render-a", clip_id=clip.id, render_type="video", status="completed")
         export = ExportPack(id="export-a", episode_id=episode.id, status="completed", manifest={})
         session.add_all([user_a, episode, run, clip, rendered, export])
         await session.commit()
@@ -123,6 +124,38 @@ async def test_delete_episode_removes_owned_episode_and_children() -> None:
         assert await session.get(ClipCandidate, "clip-a") is None
         assert await session.get(RenderedClip, "render-a") is None
         assert await session.get(ExportPack, "export-a") is None
+
+
+async def test_delete_clip_removes_owned_output() -> None:
+    sessionmaker = await _sessionmaker()
+    async with sessionmaker() as session:
+        user_a, _user_b = _users()
+        episode = Episode(id="episode-a", owner_user_id=user_a.id, title="A", status="draft")
+        run = AnalysisRun(id="run-a", episode_id=episode.id, mode="mock", status="completed")
+        clip = ClipCandidate(
+            id="clip-a",
+            episode_id=episode.id,
+            analysis_run_id=run.id,
+            clip_type="short",
+            moment_type="expert_insight",
+            status="recommended",
+            start_seconds=0,
+            end_seconds=60,
+            duration_seconds=60,
+            excerpt="A useful clip excerpt.",
+            reasoning="A strong reason.",
+            rank=1,
+        )
+        rendered = RenderedClip(id="render-a", clip_id=clip.id, render_type="video", status="completed")
+        session.add_all([user_a, episode, run, clip, rendered])
+        await session.commit()
+
+        request = SimpleNamespace(state=SimpleNamespace(auth_user=SimpleNamespace(id=user_a.id)))
+        response = await delete_clip("clip-a", request, session)
+
+        assert response == {"status": "deleted", "clip_id": "clip-a"}
+        assert await session.get(ClipCandidate, "clip-a") is None
+        assert await session.get(RenderedClip, "render-a") is None
 
 
 async def _sessionmaker():
@@ -138,14 +171,12 @@ def _users() -> tuple[User, User]:
             id="user-a",
             username="a",
             display_name="User A",
-            role="Content Operations",
             password_hash="hash",
         ),
         User(
             id="user-b",
             username="b",
             display_name="User B",
-            role="Content Operations",
             password_hash="hash",
         ),
     )

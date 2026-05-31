@@ -16,6 +16,11 @@ def provider_status(settings: Settings) -> dict[str, Any]:
             and settings.resolved_azure_openai_api_key
             and settings.resolved_azure_openai_chat_deployment
         ),
+        "azure_openai_transcription_configured": bool(
+            settings.resolved_azure_openai_endpoint
+            and settings.resolved_azure_openai_api_key
+            and settings.resolved_azure_openai_transcription_deployment
+        ),
         "openai_configured": bool(settings.openai_api_key),
     }
     logger.debug(

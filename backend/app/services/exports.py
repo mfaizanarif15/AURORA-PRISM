@@ -91,7 +91,6 @@ async def _approved_clips(session: AsyncSession, episode_id: str) -> list[ClipCa
         select(ClipCandidate)
         .where(ClipCandidate.episode_id == episode_id, ClipCandidate.status.in_(["approved", "exported"]))
         .options(
-            selectinload(ClipCandidate.score),
             selectinload(ClipCandidate.metadata_items),
             selectinload(ClipCandidate.rendered_clips),
         )
@@ -104,7 +103,6 @@ async def _approved_clips(session: AsyncSession, episode_id: str) -> list[ClipCa
             select(ClipCandidate)
             .where(ClipCandidate.episode_id == episode_id)
             .options(
-                selectinload(ClipCandidate.score),
                 selectinload(ClipCandidate.metadata_items),
                 selectinload(ClipCandidate.rendered_clips),
             )
@@ -125,9 +123,10 @@ def _manifest(episode: Episode, clips: list[ClipCandidate]) -> dict:
             {
                 "id": clip.id,
                 "clip_type": clip.clip_type,
+                "target_platform": clip.target_platform,
+                "purpose": clip.purpose,
                 "start": seconds_to_timestamp(clip.start_seconds),
                 "end": seconds_to_timestamp(clip.end_seconds),
-                "score": clip.score.total_score if clip.score else None,
             }
             for clip in clips
         ],
@@ -140,9 +139,8 @@ def _write_markdown(path: Path, episode: Episode, clips: list[ClipCandidate]) ->
     for clip in clips:
         lines.extend(
             [
-                f"## Clip {clip.rank}: {clip.clip_type.title()}",
+                f"## Output {clip.rank}: {clip.purpose}",
                 f"- Time: {seconds_to_timestamp(clip.start_seconds)} - {seconds_to_timestamp(clip.end_seconds)}",
-                f"- Score: {clip.score.total_score if clip.score else 'N/A'}",
                 f"- Moment: {clip.moment_type}",
                 f"- Reasoning: {clip.reasoning}",
                 "",
@@ -168,16 +166,16 @@ def _write_csv(path: Path, clips: list[ClipCandidate]) -> None:
     logger.debug("Writing CSV export path={} clip_count={}", path, len(clips))
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["rank", "clip_type", "status", "start", "end", "score", "excerpt"])
+        writer.writerow(["rank", "purpose", "target_platform", "status", "start", "end", "excerpt"])
         for clip in clips:
             writer.writerow(
                 [
                     clip.rank,
-                    clip.clip_type,
+                    clip.purpose,
+                    clip.target_platform,
                     clip.status,
                     seconds_to_timestamp(clip.start_seconds),
                     seconds_to_timestamp(clip.end_seconds),
-                    clip.score.total_score if clip.score else "",
                     clip.excerpt,
                 ]
             )
@@ -200,7 +198,7 @@ def _write_pdf(path: Path, episode: Episode, clips: list[ClipCandidate]) -> None
         pdf.drawString(
             48,
             y,
-            f"Clip {clip.rank} | {clip.clip_type} | {seconds_to_timestamp(clip.start_seconds)} - {seconds_to_timestamp(clip.end_seconds)}",
+            f"Output {clip.rank} | {clip.purpose} | {seconds_to_timestamp(clip.start_seconds)} - {seconds_to_timestamp(clip.end_seconds)}",
         )
         y -= 16
         for line in _wrap(clip.reasoning, 95)[:4]:
@@ -216,11 +214,10 @@ def _write_docx(path: Path, episode: Episode, clips: list[ClipCandidate]) -> Non
     document.add_heading(f"{episode.title} Handoff", 0)
     document.add_paragraph(f"Guest: {episode.guest_name or 'TBD'}")
     for clip in clips:
-        document.add_heading(f"Clip {clip.rank}: {clip.clip_type.title()}", level=1)
+        document.add_heading(f"Output {clip.rank}: {clip.purpose}", level=1)
         document.add_paragraph(
             f"{seconds_to_timestamp(clip.start_seconds)} - {seconds_to_timestamp(clip.end_seconds)}"
         )
-        document.add_paragraph(f"Score: {clip.score.total_score if clip.score else 'N/A'}")
         document.add_paragraph(clip.reasoning)
         document.add_paragraph(clip.excerpt)
     document.save(str(path))

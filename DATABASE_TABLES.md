@@ -2,6 +2,8 @@
 
 This project uses PostgreSQL for the main application database.
 
+This document is the maintained database reference for the application schema.
+
 ## Connection
 
 Local `.env` connection string:
@@ -36,14 +38,14 @@ The main app database has 12 application tables.
 | --- | --- | --- |
 | 1 | `users` | Stores sign-up/login users and password hashes. |
 | 2 | `episodes` | Stores podcast episode records and workflow status. |
-| 3 | `episode_contexts` | Stores ICP, target audience, business objectives, and editorial context for one episode. |
+| 3 | `episode_contexts` | Stores ideal customer profile, target audience, business objectives, and editorial context for one episode. |
 | 4 | `assets` | Stores uploaded media, documents, brand references, paths, and extracted text. |
 | 5 | `transcript_segments` | Stores timestamped transcript rows for an episode. |
 | 6 | `analysis_runs` | Stores each clip analysis request, mode, status, summary, and errors. |
-| 7 | `clip_candidates` | Stores recommended clip windows, timing, ranking, status, excerpt, and reasoning. |
+| 7 | `clip_candidates` | Stores section-specific output windows, timing, ranking, status, excerpt, and reasoning. |
 | 8 | `clip_scores` | Stores one score breakdown for each clip candidate. |
 | 9 | `clip_metadata` | Stores platform-specific titles, hooks, captions, CTAs, hashtags, and risk flags for clips. |
-| 10 | `approval_events` | Stores clip review actions such as approved, rejected, or needs revision. |
+| 10 | `approval_events` | Stores clip review actions such as approved or rejected. |
 | 11 | `rendered_clips` | Stores render output records, file paths, filenames, status, and errors. |
 | 12 | `export_packs` | Stores export ZIP handoff packages and manifests. |
 
@@ -60,7 +62,6 @@ Key columns:
 | `id` | `String(36)` | Primary key UUID string. |
 | `username` | `String(255)` | Unique normalized username. |
 | `display_name` | `String(255)` | User-facing name. |
-| `role` | `String(64)` | User role, default `Content Operations`. |
 | `password_hash` | `Text` | PBKDF2-SHA256 password hash. |
 | `is_active` | `Boolean` | Whether the user can sign in. |
 | `last_login_at` | `DateTime(timezone=True)` | Last successful login timestamp. |
@@ -86,7 +87,6 @@ Key columns:
 | `guest_role` | `String(255)` | Optional guest role. |
 | `guest_company` | `String(255)` | Optional guest company. |
 | `recording_date` | `String(64)` | Optional recording date. |
-| `theme` | `String(255)` | Optional episode theme. |
 | `status` | `String(64)` | Episode workflow status, default `draft`. |
 | `created_at` | `DateTime(timezone=True)` | Created timestamp. |
 | `updated_at` | `DateTime(timezone=True)` | Updated timestamp. |
@@ -114,7 +114,6 @@ Key columns:
 | `icp` | `Text` | Ideal customer profile. |
 | `target_audience` | `Text` | Target audience description. |
 | `audience_pain_points` | `Text` | Audience pain points. |
-| `tkxel_services` | `Text` | Relevant TKXEL services. |
 | `hot_topic` | `Text` | Main hot topic. |
 | `business_objectives` | `Text` | Business goals for the episode. |
 | `episode_plan` | `Text` | Optional editorial plan. |
@@ -190,7 +189,7 @@ Relationships:
 
 ### `clip_candidates`
 
-Generated clip recommendations.
+Generated section-specific output recommendations.
 
 Key columns:
 
@@ -200,6 +199,8 @@ Key columns:
 | `episode_id` | `String(36)` | Foreign key to `episodes.id`. |
 | `analysis_run_id` | `String(36)` | Foreign key to `analysis_runs.id`. |
 | `clip_type` | `String(64)` | `short` or `highlight`. |
+| `target_platform` | `String(64)` | Output section key such as `tiktok`, `instagram_reels`, `youtube_shorts`, `linkedin`, or `generic`. |
+| `purpose` | `String(128)` | User-facing section label such as TikTok, Reels, YouTube Shorts, LinkedIn, or Highlight. |
 | `moment_type` | `String(128)` | Moment category. |
 | `status` | `String(64)` | Default `recommended`; can be approved, rejected, etc. |
 | `start_seconds` | `Float` | Clip start time. |
@@ -211,7 +212,7 @@ Key columns:
 
 Relationships:
 
-- Has one `clip_scores` row.
+- May have a legacy `clip_scores` row.
 - Has many `clip_metadata`, `approval_events`, and `rendered_clips`.
 
 Indexes:
@@ -220,7 +221,7 @@ Indexes:
 
 ### `clip_scores`
 
-Score breakdown for a clip candidate.
+Legacy score breakdown for a clip candidate. New analysis output no longer exposes or creates score breakdowns.
 
 Key columns:
 
@@ -229,7 +230,7 @@ Key columns:
 | `id` | `String(36)` | Primary key UUID string. |
 | `clip_id` | `String(36)` | Unique foreign key to `clip_candidates.id`. |
 | `total_score` | `Integer` | Overall score. |
-| `icp_relevance` | `Integer` | ICP relevance score. |
+| `icp_relevance` | `Integer` | Ideal customer profile relevance score. |
 | `tkxel_alignment` | `Integer` | TKXEL alignment score. |
 | `hook_strength` | `Integer` | Hook strength score. |
 | `virality_potential` | `Integer` | Virality potential score. |
@@ -296,7 +297,7 @@ Key columns:
 | --- | --- | --- |
 | `id` | `String(36)` | Primary key UUID string. |
 | `clip_id` | `String(36)` | Foreign key to `clip_candidates.id`. |
-| `render_type` | `String(64)` | `original`, `vertical`, `audio`, or `waveform`. |
+| `render_type` | `String(64)` | `video` or `audio`. |
 | `status` | `String(64)` | Default `pending`; can become `running`, `completed`, or `failed`. |
 | `path` | `Text` | Optional rendered file path. |
 | `filename` | `String(512)` | Optional rendered filename. |

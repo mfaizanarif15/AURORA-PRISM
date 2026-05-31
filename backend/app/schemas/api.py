@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class EpisodeCreate(BaseModel):
@@ -9,7 +9,6 @@ class EpisodeCreate(BaseModel):
     guest_role: str | None = None
     guest_company: str | None = None
     recording_date: str | None = None
-    theme: str | None = None
 
 
 class EpisodeUpdate(BaseModel):
@@ -18,7 +17,6 @@ class EpisodeUpdate(BaseModel):
     guest_role: str | None = None
     guest_company: str | None = None
     recording_date: str | None = None
-    theme: str | None = None
 
 
 class EpisodeAutoTitleRequest(BaseModel):
@@ -29,7 +27,6 @@ class EpisodeContextUpdate(BaseModel):
     icp: str | None = None
     target_audience: str | None = None
     audience_pain_points: str | None = None
-    tkxel_services: str | None = None
     hot_topic: str | None = None
     business_objectives: str | None = None
     episode_plan: str | None = None
@@ -64,7 +61,6 @@ class AuthUserRead(BaseModel):
     id: str
     username: str
     display_name: str
-    role: str
 
 
 class AuthSessionRead(BaseModel):
@@ -74,42 +70,78 @@ class AuthSessionRead(BaseModel):
     user: AuthUserRead
 
 
+ANALYSIS_SECTION_KEYS = ("tiktok", "instagram_reels", "youtube_shorts", "linkedin", "highlights")
+CLIP_STATUSES = ("draft", "recommended", "approved", "rejected", "exported")
+ANALYSIS_SECTION_DURATION_DEFAULTS = {
+    "tiktok": (30, 60),
+    "instagram_reels": (30, 75),
+    "youtube_shorts": (30, 90),
+    "linkedin": (45, 120),
+    "highlights": (180, 360),
+}
+
+
+class AnalysisSectionConfig(BaseModel):
+    enabled: bool = True
+    target_count: int = Field(default=3, ge=1, le=10)
+    duration_min_seconds: int | None = Field(default=None, ge=1, le=1800)
+    duration_max_seconds: int | None = Field(default=None, ge=1, le=1800)
+
+    @model_validator(mode="after")
+    def validate_duration_range(self) -> "AnalysisSectionConfig":
+        if (
+            self.duration_min_seconds is not None
+            and self.duration_max_seconds is not None
+            and self.duration_min_seconds > self.duration_max_seconds
+        ):
+            raise ValueError("duration_min_seconds must be less than or equal to duration_max_seconds")
+        return self
+
+
+def default_analysis_sections() -> dict[str, AnalysisSectionConfig]:
+    return {
+        "tiktok": AnalysisSectionConfig(enabled=True, target_count=3),
+        "instagram_reels": AnalysisSectionConfig(enabled=True, target_count=3),
+        "youtube_shorts": AnalysisSectionConfig(enabled=True, target_count=3),
+        "linkedin": AnalysisSectionConfig(enabled=True, target_count=3),
+        "highlights": AnalysisSectionConfig(enabled=False, target_count=3),
+    }
+
+
 class AnalysisRequest(BaseModel):
     ai_provider: Literal["azure_openai", "openai"] = "azure_openai"
     clip_types: list[Literal["short", "highlight"]] = Field(default_factory=lambda: ["short", "highlight"])
     duration_min_seconds: int | None = None
     duration_max_seconds: int | None = None
-    target_clip_count: int = Field(default=10, ge=1, le=30)
+    target_clip_count: int = Field(default=3, ge=1, le=10)
     platforms: list[str] = Field(default_factory=lambda: ["youtube_shorts", "linkedin", "instagram_reels", "tiktok"])
     custom_instructions: str | None = None
     mode: Literal["mock", "hybrid", "openai"] = "hybrid"
+    sections: dict[str, AnalysisSectionConfig] = Field(default_factory=default_analysis_sections)
+
+    @model_validator(mode="after")
+    def normalize_sections(self) -> "AnalysisRequest":
+        defaults = default_analysis_sections()
+        normalized: dict[str, AnalysisSectionConfig] = {}
+        for key in ANALYSIS_SECTION_KEYS:
+            normalized[key] = self.sections.get(key, defaults[key])
+        self.sections = normalized
+        if not any(config.enabled for config in self.sections.values()):
+            raise ValueError("At least one output section must be enabled")
+        return self
+
+    def enabled_sections(self) -> list[tuple[str, AnalysisSectionConfig]]:
+        return [(key, config) for key, config in self.sections.items() if config.enabled]
 
 
 class ClipStatusUpdate(BaseModel):
-    status: Literal["draft", "recommended", "approved", "rejected", "needs_revision", "exported"]
+    status: Literal["draft", "recommended", "approved", "rejected", "exported"]
     user_name: str | None = "Demo Reviewer"
     comments: str | None = None
 
 
 class RenderRequest(BaseModel):
-    render_types: list[Literal["original", "vertical", "audio", "waveform"]] = Field(
-        default_factory=lambda: ["original", "vertical"]
-    )
-
-
-class ScoreRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    total_score: int
-    icp_relevance: int
-    tkxel_alignment: int
-    hook_strength: int
-    virality_potential: int
-    business_value: int
-    guest_authority: int
-    topic_fit: int
-    audio_confidence: int
-    explanation: str
+    render_types: list[Literal["video", "audio"]] = Field(default_factory=list)
 
 
 class MetadataRead(BaseModel):
@@ -143,6 +175,8 @@ class ClipRead(BaseModel):
     id: str
     episode_id: str
     clip_type: str
+    target_platform: str
+    purpose: str
     moment_type: str
     status: str
     start_seconds: float
@@ -151,7 +185,6 @@ class ClipRead(BaseModel):
     excerpt: str
     reasoning: str
     rank: int
-    score: ScoreRead | None
     metadata: list[MetadataRead]
     rendered_clips: list[RenderedClipRead]
 
@@ -165,7 +198,6 @@ class EpisodeRead(BaseModel):
     guest_role: str | None
     guest_company: str | None
     recording_date: str | None
-    theme: str | None
     status: str
     clip_count: int = 0
     asset_count: int = 0
@@ -212,4 +244,5 @@ class AiProviderRead(BaseModel):
     default_provider: Literal["azure_openai", "openai"]
     providers: list[Literal["azure_openai", "openai"]]
     azure_openai_configured: bool
+    azure_openai_transcription_configured: bool
     openai_configured: bool

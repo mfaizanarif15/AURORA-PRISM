@@ -20,7 +20,7 @@ Authentication is enabled by default. Call `POST /auth/login` and send the retur
 Authorization: Bearer <access_token>
 ```
 
-For browser APIs that cannot attach custom headers, such as EventSource and direct downloads, the frontend appends `?token=<access_token>`.
+For browser download URLs that cannot attach custom headers, the frontend appends `?token=<access_token>`.
 
 The app supports database-backed sign up and login. If the `users` table is empty, these configured local credentials can bootstrap the first user:
 
@@ -57,8 +57,7 @@ Output:
   "user": {
     "id": "user-uuid",
     "username": "operator",
-    "display_name": "AURORA Operator",
-    "role": "Content Operations"
+    "display_name": "AURORA Operator"
   }
 }
 ```
@@ -84,8 +83,7 @@ Output:
   "user": {
     "id": "user-uuid",
     "username": "admin",
-    "display_name": "AURORA Operator",
-    "role": "Content Operations"
+    "display_name": "AURORA Operator"
   }
 }
 ```
@@ -121,8 +119,7 @@ Output:
   "user": {
     "id": "user-uuid",
     "username": "operator",
-    "display_name": "AURORA Operator",
-    "role": "Content Operations"
+    "display_name": "AURORA Operator"
   }
 }
 ```
@@ -142,19 +139,25 @@ Clip types:
 Clip statuses:
 
 ```json
-["draft", "recommended", "approved", "rejected", "needs_revision", "exported"]
+["draft", "recommended", "approved", "rejected", "exported"]
 ```
 
-Platforms:
+Output section keys:
 
 ```json
-["youtube_shorts", "tiktok", "instagram_reels", "linkedin"]
+["tiktok", "instagram_reels", "youtube_shorts", "linkedin", "highlights"]
+```
+
+Metadata platforms:
+
+```json
+["youtube_shorts", "tiktok", "instagram_reels", "linkedin", "generic"]
 ```
 
 Render types:
 
 ```json
-["original", "vertical", "audio", "waveform"]
+["video", "audio"]
 ```
 
 AI providers:
@@ -181,10 +184,10 @@ Analysis modes:
   "guest_role": "Founder and CEO",
   "guest_company": "Qantm AI",
   "recording_date": "2024-11-25",
-  "theme": "Preventing Global Tech Homogenization",
   "status": "draft",
   "clip_count": 0,
   "asset_count": 0,
+  "media_asset_count": 0,
   "transcript_segment_count": 0
 }
 ```
@@ -210,6 +213,8 @@ Analysis modes:
   "id": "uuid",
   "episode_id": "uuid",
   "clip_type": "short",
+  "target_platform": "youtube_shorts",
+  "purpose": "YouTube Shorts",
   "moment_type": "expert_insight",
   "status": "recommended",
   "start_seconds": 246.0,
@@ -218,18 +223,6 @@ Analysis modes:
   "excerpt": "Transcript excerpt...",
   "reasoning": "Why this clip matters...",
   "rank": 1,
-  "score": {
-    "total_score": 82,
-    "icp_relevance": 84,
-    "tkxel_alignment": 78,
-    "hook_strength": 86,
-    "virality_potential": 80,
-    "business_value": 83,
-    "guest_authority": 90,
-    "topic_fit": 84,
-    "audio_confidence": 72,
-    "explanation": "Score explanation..."
-  },
   "metadata": [
     {
       "platform": "youtube_shorts",
@@ -252,9 +245,9 @@ Analysis modes:
   "rendered_clips": [
     {
       "id": "uuid",
-      "render_type": "vertical",
+      "render_type": "video",
       "status": "completed",
-      "filename": "01-short-vertical-246.mp4",
+      "filename": "01-short-video-246.mp4",
       "error": null
     }
   ]
@@ -296,6 +289,7 @@ Output:
   "default_provider": "azure_openai",
   "providers": ["azure_openai", "openai"],
   "azure_openai_configured": true,
+  "azure_openai_transcription_configured": false,
   "openai_configured": false
 }
 ```
@@ -342,10 +336,10 @@ Output:
     "guest_role": "Guest role",
     "guest_company": "Guest company",
     "recording_date": "2024-11-25",
-    "theme": "Episode theme",
     "status": "analyzed",
     "clip_count": 10,
     "asset_count": 4,
+    "media_asset_count": 2,
     "transcript_segment_count": 603
   }
 ]
@@ -363,8 +357,7 @@ Input JSON:
   "guest_name": "Dr. Seth Dobrin",
   "guest_role": "Founder and CEO",
   "guest_company": "Qantm AI",
-  "recording_date": "2024-11-25",
-  "theme": "Preventing Global Tech Homogenization"
+  "recording_date": "2024-11-25"
 }
 ```
 
@@ -410,8 +403,7 @@ Input JSON:
   "guest_name": "Dr. Seth Dobrin",
   "guest_role": "Founder and CEO",
   "guest_company": "Qantm AI",
-  "recording_date": "2024-11-25",
-  "theme": "AI governance"
+  "recording_date": "2024-11-25"
 }
 ```
 
@@ -481,7 +473,6 @@ Input JSON:
   "icp": "B2B technology leaders and enterprise product teams",
   "target_audience": "Executives evaluating AI strategy",
   "audience_pain_points": "AI risk, unclear ROI, implementation cost",
-  "tkxel_services": "AI strategy, product engineering, data platforms",
   "hot_topic": "AI governance and business impact",
   "business_objectives": "Grow BetterTech audience and create qualified conversations",
   "episode_plan": "Find strong shorts and deeper highlights",
@@ -537,6 +528,9 @@ Supported examples:
 - Transcript/supporting docs: TXT/PDF/DOCX/CSV/VTT/SRT
 - Images: PNG/JPG/WebP
 
+PDF, DOCX, TXT, Markdown, CSV, VTT, and SRT uploads are parsed into `assets.extracted_text`.
+Parsed `guest_document`, `brand_reference`, `document`, and `supporting_document` assets are included as supporting context during analysis.
+
 Output: `AssetRead`
 
 Example:
@@ -554,7 +548,7 @@ Errors:
 
 ### POST `/episodes/{episode_id}/transcript`
 
-Uploads or pastes a timestamped transcript. Existing transcript segments for the episode are replaced.
+Uploads, pastes, or transcribes a transcript source. Existing transcript segments for the episode are replaced after a transcript is parsed successfully. If audio transcription is skipped because no transcription provider is configured, the uploaded audio asset is saved and existing transcript segments are left unchanged.
 
 Content type:
 
@@ -564,8 +558,20 @@ multipart/form-data
 
 Option A input fields:
 
-- `file`: transcript file
-- `source_format`: optional, one of `txt`, `vtt`, `srt`, `csv`
+- `file`: transcript document file or transcribable audio/video file
+- `source_format`: optional, one of `txt`, `md`, `vtt`, `srt`, `csv`, `pdf`, `docx`; ignored for audio/video files
+
+Supported transcript document files:
+
+- `txt`, `md`, `vtt`, `srt`, `csv`, `pdf`, `docx`
+- PDF/DOCX transcript files are stored as `transcript_source` assets and parsed into transcript segments
+
+Supported audio/video transcript files:
+
+- `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, `webm`
+- Uses standard OpenAI Whisper when `OPENAI_API_KEY` is set
+- Falls back to Azure transcription when `AZURE_OPENAI_TRANSCRIPTION_DEPLOYMENT`, Azure endpoint, and Azure key are configured
+- Skips transcription and returns zero segments when neither transcription provider is configured
 
 Option B input fields:
 
@@ -582,12 +588,29 @@ Output:
 }
 ```
 
+Skipped audio transcription output:
+
+```json
+{
+  "segment_count": 0,
+  "first_timestamp": null,
+  "last_timestamp": null
+}
+```
+
 Example with file:
 
 ```bash
 curl -X POST http://localhost:8100/api/episodes/{episode_id}/transcript \
   -F "source_format=txt" \
   -F "file=@seth-dobrin-bt-podcast.txt"
+```
+
+Example with audio:
+
+```bash
+curl -X POST http://localhost:8100/api/episodes/{episode_id}/transcript \
+  -F "file=@episode-audio.mp3"
 ```
 
 Example with pasted content:
@@ -602,13 +625,14 @@ This is the transcript text."
 Errors:
 
 - `400` if neither `file` nor `content` is provided
+- `400` if transcription runs but produces no transcript text or fails
 - `404` if the episode does not exist
 
 ## Analysis
 
 ### POST `/episodes/{episode_id}/analyze`
 
-Runs clip recommendation analysis for an episode. A transcript must already exist.
+Runs section-specific output analysis for an episode. A transcript must already exist.
 
 Path params:
 
@@ -619,28 +643,36 @@ Input JSON:
 ```json
 {
   "ai_provider": "azure_openai",
-  "clip_types": ["short", "highlight"],
   "duration_min_seconds": null,
   "duration_max_seconds": null,
-  "target_clip_count": 10,
-  "platforms": ["youtube_shorts", "tiktok", "instagram_reels", "linkedin"],
-  "custom_instructions": "Focus on AI governance and avoid salesy clips.",
-  "mode": "hybrid"
+  "custom_instructions": "Focus on AI governance and avoid salesy outputs.",
+  "mode": "hybrid",
+  "sections": {
+    "tiktok": { "enabled": true, "target_count": 3, "duration_min_seconds": 30, "duration_max_seconds": 60 },
+    "instagram_reels": { "enabled": true, "target_count": 3, "duration_min_seconds": 30, "duration_max_seconds": 75 },
+    "youtube_shorts": { "enabled": true, "target_count": 3, "duration_min_seconds": 30, "duration_max_seconds": 90 },
+    "linkedin": { "enabled": true, "target_count": 3, "duration_min_seconds": 45, "duration_max_seconds": 120 },
+    "highlights": { "enabled": false, "target_count": 3, "duration_min_seconds": 180, "duration_max_seconds": 360 }
+  }
 }
 ```
 
 Field notes:
 
-- `ai_provider`: `azure_openai` or `openai`
-- `clip_types`: use `short`, `highlight`, or both
-- `duration_min_seconds` and `duration_max_seconds`: optional custom override
-- `target_clip_count`: 1 to 30
+- `ai_provider`: defaults to `azure_openai`; section analysis uses Azure OpenAI
+- `sections`: enabled output sections, per-section target counts, and optional per-section duration ranges
+- `sections.*.duration_min_seconds` and `sections.*.duration_max_seconds`: custom timing for that section, in seconds
+- top-level `duration_min_seconds` and `duration_max_seconds`: legacy override used when per-section durations are omitted
+- `target_count`: 1 to 10 per section; defaults to 3
 - `mode`: `mock` uses local heuristics only, `hybrid` uses the LLM with heuristic fallback, and `openai` requires a provider-backed LLM call
 
 Default durations:
 
-- `short`: 30-90 seconds
-- `highlight`: 180-360 seconds
+- TikTok: 30-60 seconds
+- Reels: 30-75 seconds
+- YouTube Shorts: 30-90 seconds
+- LinkedIn: 45-120 seconds
+- Highlights: 180-360 seconds
 
 Output:
 
@@ -650,8 +682,8 @@ Output:
   "episode_id": "episode-uuid",
   "status": "completed",
   "mode": "hybrid",
-  "summary": "Generated 10 recommended clips across short, highlight using llm:azure_openai.",
-  "generated_clip_count": 10
+  "summary": "Generated 12 section outputs across tiktok, instagram_reels, youtube_shorts, linkedin using langgraph_azure(...).",
+  "generated_clip_count": 12
 }
 ```
 
@@ -663,7 +695,7 @@ Errors:
 
 ### GET `/episodes/{episode_id}/clips`
 
-Lists clip recommendations for an episode.
+Lists section outputs for an episode.
 
 Path params:
 
@@ -672,7 +704,8 @@ Path params:
 Query params:
 
 - `clip_type`: optional, `short` or `highlight`
-- `status`: optional clip status
+- `target_platform`: optional section key such as `tiktok`, `instagram_reels`, `youtube_shorts`, `linkedin`, or `generic`
+- `status`: optional output status
 
 Output:
 
@@ -682,6 +715,8 @@ Output:
     "id": "clip-uuid",
     "episode_id": "episode-uuid",
     "clip_type": "short",
+    "target_platform": "tiktok",
+    "purpose": "TikTok",
     "moment_type": "hot_take",
     "status": "recommended",
     "start_seconds": 246.0,
@@ -690,7 +725,6 @@ Output:
     "excerpt": "Transcript excerpt...",
     "reasoning": "Why this clip matters...",
     "rank": 1,
-    "score": {},
     "metadata": [],
     "rendered_clips": []
   }
@@ -705,7 +739,7 @@ curl "http://localhost:8100/api/episodes/{episode_id}/clips?clip_type=short&stat
 
 ### GET `/clips/{clip_id}`
 
-Fetches one clip recommendation with score, metadata, and rendered outputs.
+Fetches one clip recommendation with metadata and rendered outputs.
 
 Path params:
 
@@ -719,7 +753,7 @@ Errors:
 
 ### PATCH `/clips/{clip_id}/status`
 
-Approves, rejects, or marks a clip for revision. Also creates an approval event.
+Approves or rejects a clip. Also creates an approval event.
 
 Path params:
 
@@ -755,16 +789,14 @@ Input JSON:
 
 ```json
 {
-  "render_types": ["original", "vertical"]
+  "render_types": ["video", "audio"]
 }
 ```
 
 Behavior:
 
-- If source video exists, `original` and `vertical` create MP4 files.
-- If only audio exists, `original` falls back to `audio` and `vertical` falls back to `waveform`.
-- `audio` creates an audio-only file.
-- `waveform` creates a simple 9:16 waveform MP4.
+- `video` creates an MP4 clip from the uploaded source video.
+- `audio` creates an audio-only file from the uploaded source audio or video.
 
 Output:
 
@@ -772,9 +804,9 @@ Output:
 [
   {
     "id": "render-uuid",
-    "render_type": "vertical",
+    "render_type": "video",
     "status": "completed",
-    "filename": "01-short-vertical-246.mp4",
+    "filename": "01-short-video-246.mp4",
     "error": null
   }
 ]
@@ -782,6 +814,7 @@ Output:
 
 Errors:
 
+- `400` if no compatible media asset exists or FFmpeg is unavailable
 - `404` if the clip does not exist
 
 ### GET `/renders/{render_id}/download`
@@ -804,7 +837,7 @@ Errors:
 
 ### POST `/episodes/{episode_id}/exports`
 
-Creates a ZIP handoff package for approved clips. If no clips are approved, the current implementation falls back to the top five clips.
+Creates a ZIP handoff package for approved outputs. If no outputs are approved, the current implementation falls back to the top five outputs.
 
 Path params:
 
@@ -828,8 +861,7 @@ Output:
         "id": "clip-uuid",
         "clip_type": "short",
         "start": "04:06.000",
-        "end": "05:18.000",
-        "score": 82
+        "end": "05:18.000"
       }
     ]
   },
@@ -881,7 +913,7 @@ curl -X POST http://localhost:8100/api/episodes \
 ```bash
 curl -X PATCH http://localhost:8100/api/episodes/{episode_id}/context \
   -H "Content-Type: application/json" \
-  -d '{"icp":"B2B tech leaders","hot_topic":"AI strategy","tkxel_services":"AI strategy, product engineering"}'
+  -d '{"icp":"B2B tech leaders","hot_topic":"AI strategy"}'
 ```
 
 3. Upload media asset:
@@ -905,10 +937,10 @@ curl -X POST http://localhost:8100/api/episodes/{episode_id}/transcript \
 ```bash
 curl -X POST http://localhost:8100/api/episodes/{episode_id}/analyze \
   -H "Content-Type: application/json" \
-  -d '{"ai_provider":"azure_openai","clip_types":["short","highlight"],"target_clip_count":10,"platforms":["youtube_shorts","tiktok","instagram_reels","linkedin"],"mode":"hybrid"}'
+  -d '{"ai_provider":"azure_openai","mode":"hybrid","sections":{"tiktok":{"enabled":true,"target_count":3,"duration_min_seconds":30,"duration_max_seconds":60},"instagram_reels":{"enabled":true,"target_count":3,"duration_min_seconds":30,"duration_max_seconds":75},"youtube_shorts":{"enabled":true,"target_count":3,"duration_min_seconds":30,"duration_max_seconds":90},"linkedin":{"enabled":true,"target_count":3,"duration_min_seconds":45,"duration_max_seconds":120},"highlights":{"enabled":false,"target_count":3,"duration_min_seconds":180,"duration_max_seconds":360}}}'
 ```
 
-6. Approve a clip:
+6. Approve an output:
 
 ```bash
 curl -X PATCH http://localhost:8100/api/clips/{clip_id}/status \
@@ -916,12 +948,12 @@ curl -X PATCH http://localhost:8100/api/clips/{clip_id}/status \
   -d '{"status":"approved","user_name":"Demo Reviewer","comments":"Approved for export."}'
 ```
 
-7. Render clip:
+7. Render output:
 
 ```bash
 curl -X POST http://localhost:8100/api/clips/{clip_id}/render \
   -H "Content-Type: application/json" \
-  -d '{"render_types":["original","vertical"]}'
+  -d '{"render_types":["video","audio"]}'
 ```
 
 8. Create export:
